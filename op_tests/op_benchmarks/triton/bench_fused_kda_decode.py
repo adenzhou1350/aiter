@@ -122,7 +122,84 @@ def _make_inputs(batch, Hloc):
     }
 
 
+def _make_spec_inputs(batch, Hloc, num_spec):
+    """Speculative decode inputs: num_spec + 1 tokens per sequence, 2-D state
+    indices (slot 0 is vLLM's NULL block, so real slots start at 1), and a
+    convolution cache that holds history plus previous draft candidates."""
+    lp = Hloc * D
+    S = num_spec + 1
+    T = batch * S
+    num_slots = batch * S + 2
+    torch.manual_seed(0)
+    return {
+        "mixed_qkv": torch.randn(T, 3 * lp, dtype=DTYPE, device=DEVICE),
+        "conv_weight": torch.randn(3 * lp, W, dtype=DTYPE, device=DEVICE) * 0.1,
+        "conv_state": torch.randn(
+            num_slots, 3 * lp, W - 1 + num_spec, dtype=DTYPE, device=DEVICE
+        )
+        * 0.1,
+        "gate": torch.randn(1, T, Hloc, D, dtype=DTYPE, device=DEVICE) * 0.5,
+        "beta": torch.randn(1, T, Hloc, dtype=DTYPE, device=DEVICE),
+        "out_gate": torch.randn(T, lp, dtype=DTYPE, device=DEVICE),
+        "A_log": torch.randn(Hloc, dtype=DTYPE, device=DEVICE) * 0.1,
+        "dt_bias": torch.randn(lp, dtype=DTYPE, device=DEVICE) * 0.1,
+        "ssm_state": torch.randn(
+            num_slots, Hloc, D, D, dtype=torch.float32, device=DEVICE
+        )
+        * 0.01,
+        "norm_weight": torch.ones(D, dtype=DTYPE, device=DEVICE),
+        "ssm_state_indices": torch.arange(
+            1, T + 1, dtype=torch.int32, device=DEVICE
+        ).reshape(batch, S),
+        "num_accepted_tokens": torch.ones(batch, dtype=torch.int32, device=DEVICE),
+        "conv_state_indices": torch.arange(
+            1, batch + 1, dtype=torch.int32, device=DEVICE
+        ),
+        "cu_seqlens": torch.arange(0, T + 1, S, dtype=torch.int64, device=DEVICE),
+    }
+
+
+def run_spec_benchmark(args):
+    Hloc, num_spec = args.Hloc, args.num_spec
+    print(f"\nSpeculative decode: Hloc={Hloc}, D={D}, W={W}, tokens/seq={num_spec + 1}")
+    header = f"{'Batch':>6}  {'Fused spec(us)':>15}"
+    print(header)
+    print("-" * len(header))
+    for batch in args.batches:
+        inp = _make_spec_inputs(batch, Hloc, num_spec)
+
+        def fn_fused(inp=inp):
+            cs = inp["conv_state"].clone()
+            ss = inp["ssm_state"].clone()
+            fused_kda_decode(
+                inp["mixed_qkv"],
+                cs,
+                inp["conv_weight"],
+                inp["gate"],
+                inp["beta"],
+                inp["out_gate"],
+                inp["A_log"],
+                inp["dt_bias"],
+                ss,
+                inp["ssm_state_indices"],
+                inp["cu_seqlens"],
+                inp["norm_weight"],
+                1e-6,
+                D,
+                Hloc,
+                -5.0,
+                num_accepted_tokens=inp["num_accepted_tokens"],
+                conv_state_indices=inp["conv_state_indices"],
+            )
+
+        t_fused = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+        print(f"{batch:>6}  {t_fused:>15.1f}")
+
+
 def run_benchmark(args):
+    if args.num_spec > 0:
+        run_spec_benchmark(args)
+        return
     Hloc = args.Hloc
     batches = args.batches
 
@@ -215,6 +292,13 @@ def parse_args(args=None):
         nargs="+",
         default=[1, 4, 8, 16, 32, 64, 128, 256],
         help="Batch sizes to benchmark",
+    )
+    parser.add_argument(
+        "--num-spec",
+        type=int,
+        default=0,
+        help="Draft tokens per sequence; > 0 benchmarks the speculative path "
+        "(Kimi-K3 DSpark uses 7)",
     )
     return parser.parse_args(args=args)
 

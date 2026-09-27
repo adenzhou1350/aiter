@@ -138,11 +138,8 @@ def _make_inputs(batch, Hloc, D, W=4, dtype=torch.bfloat16):
         )
         * 0.01,
         "norm_weight": torch.ones(D, dtype=dtype, device=device),
-        # Slot 0 is vLLM's NULL_BLOCK_ID. The kernel skips it, so real cache
-        # slots in this test start at 1. num_slots is batch + 2.
-        "ssm_state_indices": torch.arange(
-            1, batch + 1, dtype=torch.int32, device=device
-        ),
+        # Zero-based slots: normal decode treats slot 0 as a real cache slot.
+        "ssm_state_indices": torch.arange(batch, dtype=torch.int32, device=device),
         "cu_seqlens": torch.arange(batch + 1, dtype=torch.int64, device=device),
     }
 
@@ -273,8 +270,8 @@ def test_fused_kda_decode_pad_slot():
     ), "Conv state modified for PAD_SLOT_ID"
 
 
-def test_fused_kda_decode_skips_null_slot():
-    """vLLM NULL_BLOCK_ID (0) is skipped without modifying state or output."""
+def test_fused_kda_decode_processes_zero_slot():
+    """Normal decode treats slot 0 as a real cache slot (only < 0 is skipped)."""
     torch.manual_seed(42)
     batch, Hloc, D = 1, 2, 128
     inp = _make_inputs(batch, Hloc, D)
@@ -304,11 +301,41 @@ def test_fused_kda_decode_skips_null_slot():
         out=out,
     )
 
-    assert torch.equal(inp["ssm_state"], ssm_before), "SSM state modified for NULL slot"
-    assert torch.equal(
-        inp["conv_state"], conv_before
-    ), "Conv state modified for NULL slot"
-    assert torch.equal(out, torch.zeros_like(out)), "Output written for NULL slot"
+    assert not torch.equal(
+        inp["ssm_state"][0], ssm_before[0]
+    ), "slot 0 SSM state not updated"
+    assert not torch.equal(
+        inp["conv_state"][0], conv_before[0]
+    ), "slot 0 conv state not updated"
+    assert torch.equal(inp["ssm_state"][1:], ssm_before[1:]), "other SSM slots modified"
+    assert not torch.equal(out, torch.zeros_like(out)), "no output written for slot 0"
+
+
+def test_fused_kda_decode_rejects_noncontiguous_out():
+    """The kernels address out as tok * (H * V) + channel."""
+    batch, Hloc, D = 2, 2, 128
+    inp = _make_inputs(batch, Hloc, D)
+    out = torch.zeros(Hloc * D, batch, dtype=torch.bfloat16, device=device).t()
+    with pytest.raises(ValueError, match="contiguous"):
+        fused_kda_decode(
+            inp["mixed_qkv"],
+            inp["conv_state"],
+            inp["conv_weight"],
+            inp["gate"],
+            inp["beta"],
+            inp["out_gate"],
+            inp["A_log"],
+            inp["dt_bias"],
+            inp["ssm_state"],
+            inp["ssm_state_indices"],
+            inp["cu_seqlens"],
+            inp["norm_weight"],
+            1e-6,
+            D,
+            Hloc,
+            -5.0,
+            out=out,
+        )
 
 
 SPEC_D = 128
@@ -766,3 +793,54 @@ def test_optimized_fused_spec_decode_skips_vllm_null_block():
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
     torch.testing.assert_close(inp["conv_state"], before_cs, atol=0, rtol=0)
     torch.testing.assert_close(inp["state"], before_ss, atol=0, rtol=0)
+
+
+def _run_spec(inp, conv_weight=None, out=None):
+    return fused_kda_decode(
+        inp["mixed_qkv"],
+        inp["conv_state"],
+        inp["conv_weight"] if conv_weight is None else conv_weight,
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["state"],
+        inp["state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        SPEC_D,
+        inp["state"].shape[1],
+        -5.0,
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+        out=out,
+    )
+
+
+def test_optimized_fused_spec_decode_skips_invalid_accepted_state():
+    """A NULL accepted SSM slot with a valid conv slot must not commit the
+    convolution carry, which the parallel kernel never wrote in that case."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("parallel spec-7 kernel is only dispatched on gfx950")
+
+    inp = _make_spec_inputs(1, 2, num_spec=7, full_spec_sequence=True)
+    inp["state_indices"].zero_()  # accepted checkpoint slot is NULL
+    assert int(inp["conv_state_indices"][0]) > 0
+    before_cs, before_ss = inp["conv_state"].clone(), inp["state"].clone()
+    out = torch.zeros(8, 2 * SPEC_D, dtype=torch.bfloat16, device=device)
+    _run_spec(inp, out=out)
+    torch.testing.assert_close(inp["conv_state"], before_cs, atol=0, rtol=0)
+    torch.testing.assert_close(inp["state"], before_ss, atol=0, rtol=0)
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+
+
+def test_fused_spec_decode_rejects_unsupported_width():
+    """Both speculative paths keep exactly W - 1 = 3 history taps."""
+    inp = _make_spec_inputs(1, 2, num_spec=3, full_spec_sequence=True)
+    w3 = inp["conv_weight"][:, :3].contiguous()
+    with pytest.raises(NotImplementedError, match="W == 4"):
+        _run_spec(inp, conv_weight=w3)

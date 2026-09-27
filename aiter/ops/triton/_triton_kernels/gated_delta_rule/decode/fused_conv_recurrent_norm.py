@@ -56,6 +56,7 @@ def fused_conv_recurrent_norm_kernel(
     V: tl.constexpr,
     W: tl.constexpr,
     STATE_LEN: tl.constexpr,
+    STATE_LEN_P2: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     # Strides
     stride_x_tok,
@@ -105,14 +106,19 @@ def fused_conv_recurrent_norm_kernel(
             + checkpoint * stride_indices_tok
         ).to(tl.int64)
         conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
+        # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID for speculative
+        # decode; padded rows point at it.
+        if state_idx <= 0 or conv_state_idx <= 0:
+            return
     else:
         state_idx = tl.load(ssm_state_indices_ptr + i_n).to(tl.int64)
         conv_state_idx = state_idx
-    # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID.
-    if state_idx <= 0 or conv_state_idx <= 0:
-        return
-    tl.assume(state_idx > 0)
-    tl.assume(conv_state_idx > 0)
+        # Normal decode keeps zero-based slots valid; only PAD_SLOT_ID (< 0)
+        # is skipped.
+        if state_idx < 0:
+            return
+    tl.assume(state_idx >= 0)
+    tl.assume(conv_state_idx >= 0)
 
     lp = H * K
     q_off = i_h * K
@@ -255,22 +261,35 @@ def fused_conv_recurrent_norm_kernel(
                 b_x_v.to(p_csv.dtype.element_ty),
             )
         else:
-            # Layouts with more threads than channels replicate conv vectors.
-            # Finish all history reads before any owner updates the in-place state.
+            # Layouts with more threads than channels replicate conv vectors,
+            # so several owners shift the same slots. Read every source slot
+            # into registers, then barrier, then store: a slot-by-slot
+            # load/store loop lets a fast owner overwrite slot j + 1 before a
+            # slow owner has read it.
+            o_s = tl.arange(0, STATE_LEN_P2)
+            m_src = (o_s + 1) < STATE_LEN
+            sh_q = tl.load(
+                p_csq[None, :] + (o_s[:, None] + 1) * stride_cs_pos,
+                mask=m_src[:, None],
+            )
+            sh_k = tl.load(
+                p_csk[None, :] + (o_s[:, None] + 1) * stride_cs_pos,
+                mask=m_src[:, None],
+            )
+            sh_v = tl.load(
+                p_csv[None, :] + (o_s[:, None] + 1) * stride_cs_pos,
+                mask=m_src[:, None],
+            )
             tl.debug_barrier()
-            for j in tl.static_range(STATE_LEN - 1):
-                tl.store(
-                    p_csq + j * stride_cs_pos,
-                    tl.load(p_csq + (j + 1) * stride_cs_pos),
-                )
-                tl.store(
-                    p_csk + j * stride_cs_pos,
-                    tl.load(p_csk + (j + 1) * stride_cs_pos),
-                )
-                tl.store(
-                    p_csv + j * stride_cs_pos,
-                    tl.load(p_csv + (j + 1) * stride_cs_pos),
-                )
+            tl.store(
+                p_csq[None, :] + o_s[:, None] * stride_cs_pos, sh_q, mask=m_src[:, None]
+            )
+            tl.store(
+                p_csk[None, :] + o_s[:, None] * stride_cs_pos, sh_k, mask=m_src[:, None]
+            )
+            tl.store(
+                p_csv[None, :] + o_s[:, None] * stride_cs_pos, sh_v, mask=m_src[:, None]
+            )
             tl.store(
                 p_csq + (STATE_LEN - 1) * stride_cs_pos,
                 b_x_q.to(p_csq.dtype.element_ty),
@@ -575,6 +594,8 @@ def fused_kda_spec_finalize_kernel(
     stride_cs_dim: tl.constexpr,
     stride_cs_pos: tl.constexpr,
     stride_og_tok: tl.constexpr,
+    stride_indices_seq,
+    stride_indices_tok,
 ):
     """Normalize tiled output and commit speculative convolution state once.
 
@@ -595,8 +616,16 @@ def fused_kda_spec_finalize_kernel(
     if i_t >= seq_t:
         return
 
+    # Same validity test as the parallel kernel: when it returned early, the
+    # carry was never written and the output was never produced.
+    checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
+    read_state_idx = tl.load(
+        ssm_state_indices_ptr
+        + i_n * stride_indices_seq
+        + checkpoint * stride_indices_tok
+    ).to(tl.int64)
     conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
-    if conv_state_idx <= 0:
+    if read_state_idx <= 0 or conv_state_idx <= 0:
         return
     tl.assume(conv_state_idx > 0)
     lp: tl.constexpr = H * K

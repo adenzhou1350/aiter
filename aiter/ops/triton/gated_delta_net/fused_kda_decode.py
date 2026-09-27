@@ -8,6 +8,7 @@ eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 """
 
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
@@ -40,18 +41,27 @@ def fused_kda_decode(
 ) -> torch.Tensor:
     """Fused KDA decode: conv1d + recurrence + gated RMSNorm.
 
+    T is the number of tokens (B for single-token decode, up to B * S for
+    speculative decode, possibly padded past that by FULL decode graphs).
+
     Args:
-        mixed_qkv: [B, 3*lp] bf16, may be strided (sliced from in_proj output).
-        conv_state: [N, 3*lp, W-1] bf16, transposed view of conv cache.
+        mixed_qkv: [T, 3*lp] bf16, may be strided (sliced from in_proj output).
+        conv_state: [N, 3*lp, STATE_LEN] bf16, transposed view of conv cache.
+            STATE_LEN is W-1 for normal decode; speculative decode needs
+            STATE_LEN >= S + W - 2.
         conv_weight: [3*lp, W] or [3, W, lp], fp32 conv1d weights.
-        gate: [1, B, H, K] bf16, KDA decay gate (raw logits).
-        beta: [1, B, H] bf16, write strength (raw logits), may be strided.
-        out_gate: [B, H*K] bf16, output gate for RMSNorm, may be strided.
+        gate: [1, T, H, K] bf16, KDA decay gate (raw logits).
+        beta: [1, T, H] bf16, write strength (raw logits), may be strided.
+        out_gate: [T, H*K] bf16, output gate for RMSNorm, may be strided.
         A_log: [H] fp32, per-head decay parameter.
         dt_bias: [H*K] fp32, per-channel bias.
         ssm_state: [N, H, V, K] fp32, delta-rule state matrices.
         ssm_state_indices: [B] for normal decode or [B, S] for spec decode.
-        cu_seqlens: [B+1] int64, cumulative sequence lengths.
+            Normal decode skips negative slots (PAD_SLOT_ID); speculative
+            decode also skips slot 0 (vLLM NULL_BLOCK_ID).
+        cu_seqlens: [B+1] int64, cumulative sequence lengths. For speculative
+            decode every sequence spans at most S tokens (the width of
+            ssm_state_indices); tokens past S are not processed.
         norm_weight: [K] fp32, RMSNorm weight.
         norm_eps: float, RMSNorm epsilon.
         head_dim: int, K = V = head_dim.
@@ -59,10 +69,10 @@ def fused_kda_decode(
         lower_bound: float, KDA gate lower bound (typically -5.0).
         num_accepted_tokens: [B] int32 accepted-token counts for spec decode.
         conv_state_indices: [B] int32 convolution-cache slots for spec decode.
-        out: Optional preallocated [T, H*K] bf16 output.
+        out: Optional preallocated contiguous [T, H*K] bf16 output.
 
     Returns:
-        out: [B, H*K] bf16, final output after RMSNorm + gate.
+        out: [T, H*K] bf16, final output after RMSNorm + gate.
     """
     T = mixed_qkv.shape[0]
     K = V = head_dim
@@ -92,6 +102,9 @@ def fused_kda_decode(
         out = torch.empty(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
     elif out.shape != (T, lp):
         raise ValueError(f"Expected out shape {(T, lp)}, got {tuple(out.shape)}")
+    elif not out.is_contiguous():
+        # The kernels address out as tok * (H * V) + channel.
+        raise ValueError("out must be contiguous")
 
     # Conv weight strides: support [3*lp, W] and [3, W, lp]
     if conv_weight.dim() == 3:
@@ -104,6 +117,13 @@ def fused_kda_decode(
         stride_cw_group = lp * conv_weight.stride(0)
         stride_cw_width = conv_weight.stride(1)
         stride_cw_ch = conv_weight.stride(0)
+
+    if is_spec_decoding and W != 4:
+        # Both speculative paths keep exactly W - 1 = 3 history taps in
+        # registers.
+        raise NotImplementedError(
+            f"fused_kda_decode speculative decode supports W == 4, got W={W}"
+        )
 
     stride_beta_tok = beta.stride(1) if beta.dim() == 3 else beta.stride(0)
     stride_og_tok = out_gate.stride(0)
@@ -196,6 +216,8 @@ def fused_kda_decode(
             stride_cs_dim=conv_state.stride(1),
             stride_cs_pos=conv_state.stride(2),
             stride_og_tok=stride_og_tok,
+            stride_indices_seq=stride_indices_seq,
+            stride_indices_tok=stride_indices_tok,
             num_warps=2,
         )
         return out
@@ -225,6 +247,7 @@ def fused_kda_decode(
         V=V,
         W=W,
         STATE_LEN=conv_state.shape[2],
+        STATE_LEN_P2=triton.next_power_of_2(conv_state.shape[2]),
         IS_SPEC_DECODING=is_spec_decoding,
         stride_x_tok=mixed_qkv.stride(0),
         stride_cw_group=stride_cw_group,
