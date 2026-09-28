@@ -40,7 +40,7 @@ the relevant phase as evidence.
 - [x] 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
 - [ ] 2. FlyDSL K1 (scorer + fused top-k) — family A then B
 - [ ] 3. FlyDSL K2 (sparse GQA) — family A then B
-- [ ] 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
+- [x] 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
 - [ ] 5. Optional fusions (only after the bar)
 
 ## Locked decisions
@@ -1160,15 +1160,75 @@ Phase 3 stays open: gfx942 is unmeasured, and 3d is the superseded
 
 ### 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
 
-- [ ] Public wrappers + lazy export from `aiter/ops/flydsl/__init__.py`.
-- [ ] End-to-end op_test: indexer through GQA as one QSA layer (launches,
+- [x] Public wrappers + lazy export from `aiter/ops/flydsl/__init__.py`.
+- [x] End-to-end op_test: indexer through GQA as one QSA layer (launches,
       bytes, fused K1/K2), family A and B tables, HIP graph replay at decode.
-- [ ] vLLM `qwen4_exp` opt-in with the same three-way backend idea as #4882
+- [x] vLLM `qwen4_exp` opt-in with the same three-way backend idea as #4882
       (`auto` / FlyDSL / Triton). `auto` must not silently pick a backend that
       fails the family A gate.
-- [ ] **Done when:** one documented command on GPU 6 shows family A e2e beating
+- [x] **Done when:** one documented command on GPU 6 shows family A e2e beating
       live AMD; competitor columns still present; vLLM opt-in is callable
       without editing the default AMD path.
+
+`qsa_k1_block_ids`, `qsa_k2`, and `qsa_layer` lazy-export from
+`aiter.ops.flydsl`. `qsa_layer(..., backend=)` is `auto` / `flydsl` /
+`triton`. The default is `triton` (live AMD MQA + HIP top-k + expand +
+sparse GQA). `flydsl` is K1, that same vendored expand, and K2. The
+vendored AMD module is unchanged. `qwen4_exp/amd/ops/qsa.py` is not in
+this tree; calling `qsa_layer` is the opt-in.
+
+`auto` launches FlyDSL only for family A (`H=4`, `D=128`, GQA 24×2
+`D=256`) with `M <= 8` or `M >= 512`. That is the GPU 6 sweep below:
+every row beat live AMD, `err=0`. `M` strictly between 8 and 512 was
+not swept, and family B is not the family A gate, so both stay on
+Triton under `auto`. Explicit `backend="flydsl"` still runs them.
+
+GPU 6 / gfx950 / cold `--rotate 0` / `flydsl_venv`. `err=0` on every
+column. Bar points are decode `M∈{1,8}` at `L=32768` and prefill
+`M=512` at `L=8192`.
+
+| M | L | valid% | FlyDSL µs | live AMD µs | #4882 µs | vs AMD | vs #4882 |
+|--:|--:|-------:|----------:|------------:|---------:|-------:|---------:|
+| 1 | 512 | 25.0 | 17.02 | 21.86 | 144.11 | 0.78× | 0.12× |
+| 1 | 2048 | 99.9 | 17.10 | 23.99 | 176.58 | 0.71× | 0.10× |
+| 1 | 8192 | 99.9 | 27.43 | 29.15 | 184.37 | 0.94× | 0.15× |
+| 1 | 32768 | 99.9 | 30.65 | 34.44 | 187.54 | 0.89× | 0.16× |
+| 8 | 512 | 24.8 | 20.90 | 26.81 | 140.00 | 0.78× | 0.15× |
+| 8 | 2048 | 99.7 | 22.86 | 29.40 | 159.85 | 0.78× | 0.14× |
+| 8 | 8192 | 99.9 | 33.84 | 40.51 | 167.59 | 0.84× | 0.20× |
+| 8 | 32768 | 99.9 | 40.64 | 45.78 | 185.78 | 0.89× | 0.22× |
+| 512 | 512 | 12.5 | 163.29 | 223.94 | 249.65 | 0.73× | 0.65× |
+| 512 | 2048 | 87.4 | 234.67 | 246.18 | 265.24 | 0.95× | 0.88× |
+| 512 | 8192 | 99.9 | 271.82 | 302.85 | 316.56 | 0.90× | 0.86× |
+| 512 | 32768 | 99.9 | 315.63 | 481.97 | 492.39 | 0.65× | 0.64× |
+
+HIP graph replay at decode, one capture then hot `replay`, `err=0`:
+
+| M | L | FlyDSL µs | live AMD µs | vs AMD |
+|--:|--:|----------:|------------:|-------:|
+| 1 | 512 | 16.96 | 26.31 | 0.64× |
+| 1 | 2048 | 16.90 | 26.53 | 0.64× |
+| 1 | 8192 | 23.67 | 30.19 | 0.78× |
+| 1 | 32768 | 27.54 | 32.31 | 0.85× |
+| 8 | 512 | 21.00 | 30.09 | 0.70× |
+| 8 | 2048 | 23.40 | 33.23 | 0.70× |
+| 8 | 8192 | 29.92 | 36.58 | 0.82× |
+| 8 | 32768 | 36.56 | 39.93 | 0.92× |
+
+Family B (`H` 4 and 8, group 5, `D=128`) beats #4882 Triton and Gluon
+on every swept row, `err=0`. `auto` does not select these shapes.
+
+| M | L | H | FlyDSL µs | Triton µs | Gluon µs |
+|--:|--:|--:|----------:|----------:|---------:|
+| 1 | 32768 | 4 | 28.69 | 165.93 | 130.56 |
+| 8 | 32768 | 4 | 36.77 | 161.53 | 128.84 |
+| 512 | 8192 | 4 | 161.35 | 262.00 | 276.39 |
+| 1 | 32768 | 8 | 29.22 | 169.64 | 130.70 |
+| 8 | 32768 | 8 | 37.09 | 165.12 | 128.81 |
+| 512 | 8192 | 8 | 180.61 | 299.37 | 279.65 |
+
+The same grid at `L∈{512,2048,8192,32768}` is in
+`bench_qsa_family_b_e2e`; every cell beat both competitor columns.
 
 ### 5. Optional fusions (only after the bar)
 
