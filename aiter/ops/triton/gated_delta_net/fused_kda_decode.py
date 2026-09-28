@@ -16,6 +16,12 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurre
     fused_kda_spec_parallel_v_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+# Measured on gfx950 (the only arch that launches these kernels). The published
+# JSON is the tile; this fallback is what the loader returns when that file is
+# absent.
+_SPEC_KERNEL_FALLBACK = triton.Config({}, num_warps=2)
 
 
 def fused_kda_decode(
@@ -145,12 +151,24 @@ def fused_kda_decode(
         # The recurrence reads conv history at checkpoint + W - 2 and finalize
         # writes it at W - 2 + i_t, both with an index up to spec_tokens + 1.
         and conv_state.shape[2] >= spec_tokens + W - 2
-        # FULL decode graphs may pad the token dimension past the real
-        # batch * spec_tokens tokens. cu_seqlens remains authoritative, and the
-        # kernels bound their work by its per-sequence eos.
-        and T >= batch * spec_tokens
     )
     if use_parallel_spec:
+        # cu_seqlens stays on device. A host read would sync and break CUDA
+        # graph capture. Both kernels clamp each sequence to SPEC_LEN, so a
+        # packed batch with a short sequence still takes this path, and a span
+        # longer than the index row drops the surplus tokens.
+        parallel_cfg = get_tuned_kernel_config(
+            "attention",
+            "FUSED_KDA_DECODE",
+            "fused_kda_spec_parallel_v_kernel",
+            _SPEC_KERNEL_FALLBACK,
+        )
+        finalize_cfg = get_tuned_kernel_config(
+            "attention",
+            "FUSED_KDA_DECODE",
+            "fused_kda_spec_finalize_kernel",
+            _SPEC_KERNEL_FALLBACK,
+        )
         conv_carry = torch.empty(
             batch,
             3 * H * K,
@@ -192,7 +210,7 @@ def fused_kda_decode(
             stride_ssm_slot=ssm_state.stride(0),
             stride_indices_seq=stride_indices_seq,
             stride_indices_tok=stride_indices_tok,
-            num_warps=2,
+            num_warps=parallel_cfg.num_warps,
         )
         fused_kda_spec_finalize_kernel[(batch, H, spec_tokens)](
             mixed_qkv,
@@ -218,7 +236,7 @@ def fused_kda_decode(
             stride_og_tok=stride_og_tok,
             stride_indices_seq=stride_indices_seq,
             stride_indices_tok=stride_indices_tok,
-            num_warps=2,
+            num_warps=finalize_cfg.num_warps,
         )
         return out
 
@@ -249,6 +267,7 @@ def fused_kda_decode(
         STATE_LEN=conv_state.shape[2],
         STATE_LEN_P2=triton.next_power_of_2(conv_state.shape[2]),
         IS_SPEC_DECODING=is_spec_decoding,
+        SPEC_LEN=spec_tokens if is_spec_decoding else 1,
         stride_x_tok=mixed_qkv.stride(0),
         stride_cw_group=stride_cw_group,
         stride_cw_width=stride_cw_width,

@@ -502,7 +502,11 @@ def _ref_spec_decode(
                 ).bfloat16()
 
         if is_spec and full_spec_sequence:
-            conv_state[conv_slot_idx] = spec_next_conv_state
+            # A short span overwrites only the prefix the kernel writes
+            # (shifted history plus the tokens it processed). A full span
+            # covers the cache and matches a whole-row store.
+            written = spec_next_conv_state.shape[1]
+            conv_state[conv_slot_idx, :, :written] = spec_next_conv_state
 
     return out
 
@@ -513,10 +517,26 @@ def _make_spec_inputs(
     num_spec=0,
     full_spec_sequence=False,
     normal_seq_len=1,
+    seq_lens=None,
 ):
     lp = Hloc * SPEC_D
-    seq_len = 1 + num_spec if num_spec > 0 and full_spec_sequence else normal_seq_len
-    total_tokens = batch * seq_len
+    if seq_lens is not None:
+        seq_lens = tuple(seq_lens)
+        if len(seq_lens) != batch:
+            raise ValueError(f"seq_lens has {len(seq_lens)} entries for batch {batch}")
+        total_tokens = sum(seq_lens)
+        cu = [0]
+        for length in seq_lens:
+            cu.append(cu[-1] + length)
+        cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    else:
+        seq_len = (
+            1 + num_spec if num_spec > 0 and full_spec_sequence else normal_seq_len
+        )
+        total_tokens = batch * seq_len
+        cu_seqlens = torch.arange(
+            0, total_tokens + 1, seq_len, dtype=torch.int64, device=device
+        )
     state_len = (SPEC_W - 1 + num_spec) if num_spec > 0 else (SPEC_W - 1)
     num_slots = batch + num_spec * batch + 4
     torch.manual_seed(42)
@@ -540,9 +560,7 @@ def _make_spec_inputs(
         )
         * 0.01,
         "norm_weight": torch.ones(SPEC_D, dtype=dtype, device=device),
-        "cu_seqlens": torch.arange(
-            0, total_tokens + 1, seq_len, dtype=torch.int64, device=device
-        ),
+        "cu_seqlens": cu_seqlens,
     }
     if num_spec > 0:
         inp["state_indices"] = torch.arange(
@@ -795,6 +813,23 @@ def test_optimized_fused_spec_decode_skips_vllm_null_block():
     torch.testing.assert_close(inp["state"], before_ss, atol=0, rtol=0)
 
 
+def test_spec_decode_null_token_does_not_write_output():
+    """A live sequence with one slot-0 token must leave that output row and
+    physical slot 0 untouched. The accepted checkpoint stays valid, so the
+    sequence-level NULL return does not cover this token."""
+    inp = _make_spec_inputs(1, 2, num_spec=7, full_spec_sequence=True)
+    null_tok = inp["state_indices"].shape[1] - 1
+    inp["state_indices"][0, null_tok] = 0
+    before_slot0 = inp["state"][0].clone()
+    out = torch.zeros(8, 2 * SPEC_D, dtype=torch.bfloat16, device=device)
+    _run_spec(inp, out=out)
+    torch.testing.assert_close(
+        out[null_tok], torch.zeros_like(out[null_tok]), atol=0, rtol=0
+    )
+    torch.testing.assert_close(inp["state"][0], before_slot0, atol=0, rtol=0)
+    assert out[:null_tok].abs().max().item() > 0
+
+
 def _run_spec(inp, conv_weight=None, out=None):
     return fused_kda_decode(
         inp["mixed_qkv"],
@@ -844,3 +879,156 @@ def test_fused_spec_decode_rejects_unsupported_width():
     w3 = inp["conv_weight"][:, :3].contiguous()
     with pytest.raises(NotImplementedError, match="W == 4"):
         _run_spec(inp, conv_weight=w3)
+
+
+def _assert_spec_matches(inp, *, expect_parallel):
+    import aiter.ops.triton.gated_delta_net.fused_kda_decode as fkd
+
+    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
+    ref = _ref_spec_decode(
+        inp["mixed_qkv"],
+        ref_cs,
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        ref_ss,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        inp["state"].shape[1],
+        state_indices=inp["state_indices"],
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+        full_spec_sequence=True,
+    )
+    fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
+    with _SpecKernelSpy(fkd) as dispatched:
+        out = fused_kda_decode(
+            inp["mixed_qkv"],
+            fused_cs,
+            inp["conv_weight"],
+            inp["gate"],
+            inp["beta"],
+            inp["out_gate"],
+            inp["A_log"],
+            inp["dt_bias"],
+            fused_ss,
+            inp["state_indices"],
+            inp["cu_seqlens"],
+            inp["norm_weight"],
+            1e-6,
+            SPEC_D,
+            inp["state"].shape[1],
+            -5.0,
+            num_accepted_tokens=inp["num_accepted_tokens"],
+            conv_state_indices=inp["conv_state_indices"],
+        )
+    if expect_parallel:
+        assert dispatched.grids, "specialized spec kernel was not dispatched"
+    else:
+        assert not dispatched.grids, "specialized spec kernel ran on the fallback path"
+    torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(fused_cs, ref_cs, atol=0, rtol=0)
+    torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)
+
+
+def test_spec_decode_shorter_packed_sequence_stays_specialized():
+    """A packed batch whose token count is below batch * SPEC_LEN still uses
+    the specialized kernels. The old total-size gate sent this to the generic
+    fallback."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    inp = _make_spec_inputs(2, 2, num_spec=7, full_spec_sequence=True, seq_lens=(3, 8))
+    spec_tokens = inp["state_indices"].shape[1]
+    assert inp["mixed_qkv"].shape[0] < 2 * spec_tokens
+    _assert_spec_matches(inp, expect_parallel=get_arch() == "gfx950")
+
+
+def test_spec_decode_narrow_conv_cache_uses_generic_kernel():
+    """A conv cache one column short of spec_tokens + W - 2 cannot take the
+    specialized path. The generic kernel still has to match on a span that
+    fits the cache."""
+    num_spec = 7
+    seq_len = 4
+    inp = _make_spec_inputs(
+        1, 2, num_spec=num_spec, full_spec_sequence=True, seq_lens=(seq_len,)
+    )
+    spec_tokens = inp["state_indices"].shape[1]
+    parallel_width = spec_tokens + SPEC_W - 2
+    narrow = parallel_width - 1
+    assert seq_len <= narrow - (SPEC_W - 2)
+    inp["conv_state"] = inp["conv_state"][:, :, :narrow].contiguous()
+    _assert_spec_matches(inp, expect_parallel=False)
+
+
+def test_spec_decode_span_past_index_width_drops_surplus_tokens():
+    """A cu_seqlens span longer than ssm_state_indices is not read past the
+    row. Surplus tokens stay at the preallocated output and do not move state."""
+    hloc = 2
+    inp = _make_spec_inputs(1, hloc, num_spec=7, full_spec_sequence=True)
+    spec_tokens = inp["state_indices"].shape[1]
+    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
+    ref = _ref_spec_decode(
+        inp["mixed_qkv"],
+        ref_cs,
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        ref_ss,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        hloc,
+        state_indices=inp["state_indices"],
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+        full_spec_sequence=True,
+    )
+    extra = 2
+    lp = hloc * SPEC_D
+    dtype = inp["mixed_qkv"].dtype
+    inp["mixed_qkv"] = torch.cat(
+        [
+            inp["mixed_qkv"],
+            torch.randn(extra, 3 * lp, dtype=dtype, device=device),
+        ],
+        dim=0,
+    )
+    inp["gate"] = torch.cat(
+        [
+            inp["gate"],
+            torch.randn(1, extra, hloc, SPEC_D, dtype=dtype, device=device),
+        ],
+        dim=1,
+    )
+    inp["beta"] = torch.cat(
+        [inp["beta"], torch.randn(1, extra, hloc, dtype=dtype, device=device)],
+        dim=1,
+    )
+    inp["out_gate"] = torch.cat(
+        [inp["out_gate"], torch.randn(extra, lp, dtype=dtype, device=device)],
+        dim=0,
+    )
+    inp["cu_seqlens"] = inp["cu_seqlens"].clone()
+    inp["cu_seqlens"][-1] += extra
+    fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
+    out = torch.zeros(spec_tokens + extra, lp, dtype=torch.bfloat16, device=device)
+    # _run_spec writes the caller's state tensors. Swap in the clones.
+    saved_cs, saved_ss = inp["conv_state"], inp["state"]
+    inp["conv_state"], inp["state"] = fused_cs, fused_ss
+    try:
+        _run_spec(inp, out=out)
+    finally:
+        inp["conv_state"], inp["state"] = saved_cs, saved_ss
+    torch.testing.assert_close(out[:spec_tokens], ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(
+        out[spec_tokens:], torch.zeros_like(out[spec_tokens:]), atol=0, rtol=0
+    )
+    torch.testing.assert_close(fused_cs, ref_cs, atol=0, rtol=0)
+    torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)

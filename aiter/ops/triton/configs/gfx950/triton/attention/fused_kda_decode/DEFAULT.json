@@ -1,0 +1,8 @@
+{
+    "fused_kda_spec_parallel_v_kernel": {
+        "num_warps": 2
+    },
+    "fused_kda_spec_finalize_kernel": {
+        "num_warps": 2
+    }
+}

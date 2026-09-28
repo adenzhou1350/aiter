@@ -13,7 +13,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_conv_recurrent_norm_repr = make_kernel_repr(
     "fused_conv_recurrent_norm_kernel",
-    ["H", "K", "V", "W", "STATE_LEN", "IS_SPEC_DECODING"],
+    ["H", "K", "V", "W", "STATE_LEN", "IS_SPEC_DECODING", "SPEC_LEN"],
 )
 _fused_kda_spec_parallel_v_repr = make_kernel_repr(
     "fused_kda_spec_parallel_v_kernel",
@@ -58,6 +58,7 @@ def fused_conv_recurrent_norm_kernel(
     STATE_LEN: tl.constexpr,
     STATE_LEN_P2: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    SPEC_LEN: tl.constexpr,
     # Strides
     stride_x_tok,
     stride_cw_group,
@@ -97,6 +98,9 @@ def fused_conv_recurrent_norm_kernel(
     if seq_T == 0:
         return
     if IS_SPEC_DECODING:
+        # Three history taps are kept in registers. The wrapper rejects any
+        # other width before launch.
+        tl.static_assert(W == 4)
         checkpoint = tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1
         checkpoint = tl.maximum(checkpoint, 0)
         tl.assume(checkpoint >= 0)
@@ -127,8 +131,8 @@ def fused_conv_recurrent_norm_kernel(
     cw_q = 0 * stride_cw_group + i_h * K * stride_cw_ch
     cw_k = 1 * stride_cw_group + i_h * K * stride_cw_ch
     cw_v = 2 * stride_cw_group + i_h * V * stride_cw_ch
-    o_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, K), K), K)
-    o_v = tl.max_contiguous(tl.multiple_of(tl.arange(0, V), V), V)
+    o_k = tl.max_contiguous(tl.arange(0, K), K)
+    o_v = tl.max_contiguous(tl.arange(0, V), V)
 
     if IS_SPEC_DECODING:
         p_h = (
@@ -170,7 +174,19 @@ def fused_conv_recurrent_norm_kernel(
 
     b_A = tl.load(A_log_ptr + i_h).to(tl.float32)
 
-    for i_t in range(seq_T):
+    if IS_SPEC_DECODING:
+        # ssm_state_indices is SPEC_LEN wide, and speculative conv history is
+        # stored at W - 2 + i_t. A longer cu_seqlens span must not read past
+        # the row or past the allocated convolution cache.
+        n_tok = tl.minimum(seq_T, SPEC_LEN)
+        conv_room: tl.constexpr = STATE_LEN - (W - 2)
+        if conv_room > 0:
+            n_tok = tl.minimum(n_tok, conv_room)
+        else:
+            n_tok = 0
+    else:
+        n_tok = seq_T
+    for i_t in range(n_tok):
         tok = bos + i_t
         tl.assume(tok >= 0)
         p_x = x_ptr + tok * stride_x_tok
@@ -245,21 +261,29 @@ def fused_conv_recurrent_norm_kernel(
         b_v = b_v * tl.sigmoid(b_v)
 
         if IS_SPEC_DECODING:
-            q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
-            k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
-            v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
-            tl.store(
-                p_csq + (W - 2 + i_t) * stride_cs_pos,
-                b_x_q.to(p_csq.dtype.element_ty),
-            )
-            tl.store(
-                p_csk + (W - 2 + i_t) * stride_cs_pos,
-                b_x_k.to(p_csk.dtype.element_ty),
-            )
-            tl.store(
-                p_csv + (W - 2 + i_t) * stride_cs_pos,
-                b_x_v.to(p_csv.dtype.element_ty),
-            )
+            # Slot 0 is vLLM's NULL block. Skip the history roll and the
+            # cache write so a padded token does not advance conv state.
+            output_state_idx = tl.load(
+                ssm_state_indices_ptr
+                + i_n * stride_indices_seq
+                + i_t * stride_indices_tok
+            ).to(tl.int64)
+            if output_state_idx > 0:
+                q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
+                k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
+                v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
+                tl.store(
+                    p_csq + (W - 2 + i_t) * stride_cs_pos,
+                    b_x_q.to(p_csq.dtype.element_ty),
+                )
+                tl.store(
+                    p_csk + (W - 2 + i_t) * stride_cs_pos,
+                    b_x_k.to(p_csk.dtype.element_ty),
+                )
+                tl.store(
+                    p_csv + (W - 2 + i_t) * stride_cs_pos,
+                    b_x_v.to(p_csv.dtype.element_ty),
+                )
         else:
             # Layouts with more threads than channels replicate conv vectors,
             # so several owners shift the same slots. Read every source slot
@@ -324,19 +348,17 @@ def fused_conv_recurrent_norm_kernel(
                 + o_k[None, :]
             )
             b_h = tl.load(p_h).to(tl.float32)
-        b_h = b_h * tl.exp(b_g[None, :])
-        b_dot = tl.sum(b_h * b_k[None, :], 1)
+        b_h_next = b_h * tl.exp(b_g[None, :])
+        b_dot = tl.sum(b_h_next * b_k[None, :], 1)
         b_v = b_v - b_dot
         b_v = b_v * b_beta
-        b_h = b_h + b_v[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
+        b_h_next = b_h_next + b_v[:, None] * b_k[None, :]
+        b_o = tl.sum(b_h_next * b_q[None, :], 1)
+        # A speculative NULL slot (vLLM slot 0) must not advance the carried
+        # state or write the preallocated output. Normal decode always writes.
         if IS_SPEC_DECODING:
-            output_state_idx = tl.load(
-                ssm_state_indices_ptr
-                + i_n * stride_indices_seq
-                + i_t * stride_indices_tok
-            ).to(tl.int64)
             if output_state_idx > 0:
+                b_h = b_h_next
                 tl.assume(output_state_idx > 0)
                 p_h_out = (
                     ssm_state_ptr
@@ -346,22 +368,33 @@ def fused_conv_recurrent_norm_kernel(
                     + o_k[None, :]
                 )
                 tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
+                b_o_rounded = b_o.to(tl.bfloat16).to(tl.float32)
+                o_sumsq = tl.sum(b_o_rounded * b_o_rounded)
+                rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
+                b_w = tl.load(norm_weight_ptr + o_v).to(tl.float32)
+                b_og = tl.load(out_gate_ptr + tok * stride_og_tok + i_h * V + o_v).to(
+                    tl.float32
+                )
+                b_y = b_o_rounded * rstd * b_w * tl.sigmoid(b_og)
+                tl.store(
+                    out_ptr + tok * (H * V) + i_h * V + o_v,
+                    b_y.to(out_ptr.dtype.element_ty),
+                )
         else:
+            b_h = b_h_next
             tl.store(p_h, b_h.to(p_h.dtype.element_ty))
-
-        # ========== Gated RMSNorm ==========
-        b_o_rounded = b_o.to(tl.bfloat16).to(tl.float32)
-        o_sumsq = tl.sum(b_o_rounded * b_o_rounded)
-        rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
-        b_w = tl.load(norm_weight_ptr + o_v).to(tl.float32)
-        b_og = tl.load(out_gate_ptr + tok * stride_og_tok + i_h * V + o_v).to(
-            tl.float32
-        )
-        b_y = b_o_rounded * rstd * b_w * tl.sigmoid(b_og)
-        tl.store(
-            out_ptr + tok * (H * V) + i_h * V + o_v,
-            b_y.to(out_ptr.dtype.element_ty),
-        )
+            b_o_rounded = b_o.to(tl.bfloat16).to(tl.float32)
+            o_sumsq = tl.sum(b_o_rounded * b_o_rounded)
+            rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
+            b_w = tl.load(norm_weight_ptr + o_v).to(tl.float32)
+            b_og = tl.load(out_gate_ptr + tok * stride_og_tok + i_h * V + o_v).to(
+                tl.float32
+            )
+            b_y = b_o_rounded * rstd * b_w * tl.sigmoid(b_og)
+            tl.store(
+                out_ptr + tok * (H * V) + i_h * V + o_v,
+                b_y.to(out_ptr.dtype.element_ty),
+            )
 
 
 @triton.jit(repr=_fused_kda_spec_parallel_v_repr)
@@ -406,6 +439,7 @@ def fused_kda_spec_parallel_v_kernel(
     token). The token loop is clamped to that width so a longer cu_seqlens span
     cannot index past the row.
     """
+    tl.static_assert(W == 4)
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
     i_vt = tl.program_id(2)
@@ -451,8 +485,8 @@ def fused_kda_spec_parallel_v_kernel(
     cw_q = i_h * K * stride_cw_ch
     cw_k = stride_cw_group + i_h * K * stride_cw_ch
     cw_v = 2 * stride_cw_group + (i_h * V + v_base) * stride_cw_ch
-    o_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, K), K), K)
-    o_v = tl.max_contiguous(tl.multiple_of(tl.arange(0, BV), BV), BV)
+    o_k = tl.max_contiguous(tl.arange(0, K), K)
+    o_v = tl.max_contiguous(tl.arange(0, BV), BV)
 
     p_cs = conv_state_ptr + conv_state_idx * stride_cs_slot
     p_csq = p_cs + (q_off + o_k) * stride_cs_dim
@@ -539,24 +573,27 @@ def fused_kda_spec_parallel_v_kernel(
         b_q = b_q * tl.sigmoid(b_q)
         b_k = b_k * tl.sigmoid(b_k)
         b_v = b_v * tl.sigmoid(b_v)
-        q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
-        k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
-        v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
 
         b_q = b_q * tl.math.rsqrt(tl.sum(b_q * b_q) + 1e-6) * qk_scale
         b_k = b_k * tl.math.rsqrt(tl.sum(b_k * b_k) + 1e-6)
         b_g = lower_bound * tl.sigmoid(tl.exp(b_A) * (b_a + b_dt))
         b_beta = tl.sigmoid(b_beta_raw)
-        b_h = b_h * tl.exp(b_g[None, :])
-        b_dot = tl.sum(b_h * b_k[None, :], 1)
+        b_h_next = b_h * tl.exp(b_g[None, :])
+        b_dot = tl.sum(b_h_next * b_k[None, :], 1)
         b_u = (b_v - b_dot) * b_beta
-        b_h = b_h + b_u[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
+        b_h_next = b_h_next + b_u[:, None] * b_k[None, :]
+        b_o = tl.sum(b_h_next * b_q[None, :], 1)
 
+        # Slot 0 is vLLM's NULL block: do not roll conv history, advance the
+        # recurrent state, or write this token's output.
         output_state_idx = tl.load(
             ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
         ).to(tl.int64)
         if output_state_idx > 0:
+            q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
+            k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
+            v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
+            b_h = b_h_next
             p_h_out = (
                 ssm_state_ptr
                 + output_state_idx * stride_ssm_slot
@@ -565,10 +602,10 @@ def fused_kda_spec_parallel_v_kernel(
                 + o_k[None, :]
             )
             tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
-        tl.store(
-            out_ptr + tok * (H * V) + i_h * V + v_base + o_v,
-            b_o.to(out_ptr.dtype.element_ty),
-        )
+            tl.store(
+                out_ptr + tok * (H * V) + i_h * V + v_base + o_v,
+                b_o.to(out_ptr.dtype.element_ty),
+            )
 
 
 @triton.jit(repr=_fused_kda_spec_finalize_repr)
@@ -602,6 +639,7 @@ def fused_kda_spec_finalize_kernel(
     Launched with SPEC_LEN programs on the token axis, matching the width of
     ssm_state_indices.
     """
+    tl.static_assert(W == 4)
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
     i_t = tl.program_id(2)
@@ -629,8 +667,8 @@ def fused_kda_spec_finalize_kernel(
         return
     tl.assume(conv_state_idx > 0)
     lp: tl.constexpr = H * K
-    o_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, K), K), K)
-    o_v = tl.max_contiguous(tl.multiple_of(tl.arange(0, V), V), V)
+    o_k = tl.max_contiguous(tl.arange(0, K), K)
+    o_v = tl.max_contiguous(tl.arange(0, V), V)
     q_off = i_h * K
     k_off = lp + i_h * K
     v_off = 2 * lp + i_h * V
@@ -654,6 +692,14 @@ def fused_kda_spec_finalize_kernel(
         tl.store(p_csk + stride_cs_pos, k_h2)
         tl.store(p_csv, v_h1)
         tl.store(p_csv + stride_cs_pos, v_h2)
+
+    # The accepted-checkpoint check above does not cover a later NULL token.
+    # Slot 0 must not receive a conv-state write or a normalized output.
+    token_state_idx = tl.load(
+        ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
+    ).to(tl.int64)
+    if token_state_idx <= 0:
+        return
 
     tok = bos + i_t
     p_x = x_ptr + tok * stride_x_tok
