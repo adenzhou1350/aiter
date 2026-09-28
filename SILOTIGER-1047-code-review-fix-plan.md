@@ -236,11 +236,25 @@ counted separately. All five are still in `k2.py`.
       | 1 | 32768 | 12.75 | 12.25 |
       | 8 | 32768 | 19.26 | 18.87 |
       | 512 | 8192 | 259.49 | 263.75 |
-- [ ] **1d. Q over-read.** Q is still a 16-row tile (~516) masked after
-      the load. Group 12 and group 5 both read past the live heads.
-      Clamp before the address, or bound the descriptor to the live
-      group. Existing family A and family B K2 oracle tests stay green.
-      Re-time K2 on the bar shapes.
+- [x] **1d. Q over-read.** The QK tile is 16 rows. Group 12 and group 5
+      used to address the extra rows and mask them after the load. The
+      prologue now builds one uniform descriptor on this row's live
+      group (`num_records` is `group_size * head_dim * 2` bytes). The
+      16-row copy is unchanged, so the padding rows hardware-zero
+      instead of reading the next group or past `q`. The post-load
+      mask remains. No per-element Q address.
+      The mask already hid the extra rows, so the family A K2 oracles
+      and `test_qsa_layer_family_b_matches_oracle` (group 5) were green
+      before the change and stay green.
+
+      GPU 6, cold `--rotate 0`, `CACHE=0`, control taken immediately
+      before the candidate:
+
+      | M | L | before µs | after µs |
+      |--:|--:|----------:|---------:|
+      | 1 | 32768 | 12.17 | 12.31 |
+      | 8 | 32768 | 18.97 | 18.50 |
+      | 512 | 8192 | 264.42 | 263.49 |
 - [ ] **1e. Empty page table or cache.** `qsa_k2_serves` does not reject
       a zero-page cache or a zero-width table. The early return (~1230)
       covers only zero rows or a zero-width index list. Safe indices
