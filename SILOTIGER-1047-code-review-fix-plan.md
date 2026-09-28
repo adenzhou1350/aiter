@@ -170,14 +170,32 @@ behavior-preserving cleanup. It does not authorize a kernel rewrite.
 Review must-fix 1, 2, 3, and 5, plus the known Q over-read the review
 counted separately. All five are still in `k2.py`.
 
-- [ ] **1a. Page addressing past 4 GiB.** `make_buffer_tensor` on the whole
-      `k_cache` / `v_cache` (`k2.py` ~341) then `fx.slice` by physical page
-      (~566, ~580) uses a 32-bit descriptor offset. Page size 16, physical
-      page 262144 aliases page 0. Rebase in 64-bit once per page, then a
-      page-local descriptor. Add a `test_*` that fills page 0 and page
-      262144 with different values and checks the gather. A multi-gigabyte
-      allocation may be skipped when the device cannot hold it; record
-      the skip reason. Re-time K2 on the bar shapes.
+- [x] **1a. Page addressing past 4 GiB.** `make_buffer_tensor` on the whole
+      `k_cache` / `v_cache` then `fx.slice` by physical page uses a 32-bit
+      descriptor offset. Page size 16, physical page 262144 aliases page 0.
+      `test_k2_page_past_4gib` fills page 0 with ones and page 262144 with
+      twos and gathers both in one tile (expect 1.5 / 2 / 1). A
+      multi-gigabyte allocation is skipped when the device cannot hold it.
+
+      The kept compile specializes on cache bytes `> 2^32`. Bar shapes
+      keep the uniform whole-cache descriptor. A larger cache is a second
+      kernel: each gathered row rebases its page in 64-bit, then a
+      descriptor covers only that row. Do not put both bodies in one
+      kernel, and do not rebuild a descriptor on every row of a cache
+      that still fits.
+
+      A per-tile descriptor on every shape was tried on 2026-09-28 and
+      reverted. It was correct and too slow (GPU 6, cold `--rotate 0`,
+      `CACHE=0`): 12.36 → 16.74 µs, 18.65 → 36.65 µs, 263.93 → 1861.20 µs.
+
+      The specialization, same script, four shots. Medians sit on the
+      baseline; the 13.77 µs shot is the short-kernel spread.
+
+      | M | L | before µs | after µs (four shots) |
+      |--:|--:|----------:|-----------------------|
+      | 1 | 32768 | 12.36 | 13.77, 12.52, 12.29, 12.63 |
+      | 8 | 32768 | 18.65 | 18.91, 18.93, 18.95, 18.67 |
+      | 512 | 8192 | 263.93 | 263.37, 259.26, 260.84, 262.24 |
 - [ ] **1b. Empty first tile.** `m` starts at `-inf` (~557). An all-masked
       tile has `tile_max == -inf`, and `alpha = exp2(m_prev - m_new)` (~839)
       is NaN. The epilogue then writes zero because the denominator is not
