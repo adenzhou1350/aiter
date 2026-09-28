@@ -215,14 +215,27 @@ counted separately. All five are still in `k2.py`.
       | 1 | 32768 | 12.23 | 12.14 |
       | 8 | 32768 | 18.76 | 18.67 |
       | 512 | 8192 | 260.37 | 261.61 |
-- [ ] **1c. Output layout vs the plan cache.** Default `out` is
-      `torch.empty_like(q)` (~1218), which keeps a non-contiguous layout.
-      Only a caller-supplied `out` is checked for contiguity. `_plan`
-      (~1145) has no layout, and `_run_compiled` keeps the first compile.
-      Allocate the default `out` contiguously. `test_*`: alternating
-      `[2, 24, 256]` outputs with strides `(6144, 256, 1)` and
-      `(6144, 1, 24)` match the oracle. Re-time K2 on the bar shapes
-      (the contiguous path is the one serving uses).
+- [x] **1c. Output layout vs the plan cache.** Default `out` was
+      `torch.empty_like(q)`, which kept a non-contiguous layout. Only a
+      caller-supplied `out` is checked for contiguity. `_plan` has no
+      layout, and `_run_compiled` keeps the first compile. The default
+      is now `torch.empty(q.shape, dtype=q.dtype, device=q.device)`.
+      Caller-supplied `out` stays contiguous-required. The plan key is
+      unchanged.
+      `test_k2_default_out_ignores_query_strides` calls `[2, 24, 256]`
+      at strides `(6144, 256, 1)` and then `(6144, 1, 24)`. On the
+      unfixed tree the second call missed 12037 of 12288 elements. Both
+      match the oracle after the allocation change.
+
+      GPU 6, cold `--rotate 0`, `CACHE=0`, control taken immediately
+      before the candidate. The kernel is unchanged on this contiguous
+      path; the spread matches earlier shots of the same binary.
+
+      | M | L | before µs | after µs |
+      |--:|--:|----------:|---------:|
+      | 1 | 32768 | 12.75 | 12.25 |
+      | 8 | 32768 | 19.26 | 18.87 |
+      | 512 | 8192 | 259.49 | 263.75 |
 - [ ] **1d. Q over-read.** Q is still a 16-row tile (~516) masked after
       the load. Group 12 and group 5 both read past the live heads.
       Clamp before the address, or bound the descriptor to the live
