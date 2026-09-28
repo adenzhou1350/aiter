@@ -196,13 +196,25 @@ counted separately. All five are still in `k2.py`.
       | 1 | 32768 | 12.36 | 13.77, 12.52, 12.29, 12.63 |
       | 8 | 32768 | 18.65 | 18.91, 18.93, 18.95, 18.67 |
       | 512 | 8192 | 263.93 | 263.37, 259.26, 260.84, 262.24 |
-- [ ] **1b. Empty first tile.** `m` starts at `-inf` (~557). An all-masked
-      tile has `tile_max == -inf`, and `alpha = exp2(m_prev - m_new)` (~839)
-      is NaN. The epilogue then writes zero because the denominator is not
-      `> 0` (~989). Guard the rescale. `test_*`: Q/K zero, V one, indices
-      all `-1` except one valid column inside the split (the review's
-      `M=1, W=2048` column 16 and `M=512, W=128` column 64). Output is the
-      valid token, not zero. Re-time K2 on the bar shapes.
+- [x] **1b. Empty first tile.** `m` starts at `-inf`. An all-masked tile has
+      `tile_max == -inf`, and `alpha = exp2(m_prev - m_new)` is NaN. The
+      epilogue then writes zero because the denominator is not `> 0`.
+      One select replaces that alpha with 0 when `m_prev` is `-inf` or
+      the running denominator is 0. A finite max with a positive
+      denominator keeps the exp2 result.
+      `test_k2_empty_first_tile_keeps_later_token` failed on the unfixed
+      tree at M=512, W=128, column 64 (mean 0) and passes after the
+      guard, including the review's M=1, W=2048, column 16. Q/K are
+      zero and V is one, so the live token's output is one.
+
+      GPU 6, cold `--rotate 0`, `CACHE=0`, control taken immediately
+      before the candidate:
+
+      | M | L | before µs | after µs |
+      |--:|--:|----------:|---------:|
+      | 1 | 32768 | 12.23 | 12.14 |
+      | 8 | 32768 | 18.76 | 18.67 |
+      | 512 | 8192 | 260.37 | 261.61 |
 - [ ] **1c. Output layout vs the plan cache.** Default `out` is
       `torch.empty_like(q)` (~1218), which keeps a non-contiguous layout.
       Only a caller-supplied `out` is checked for contiguity. `_plan`
