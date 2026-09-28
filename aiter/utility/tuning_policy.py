@@ -17,6 +17,12 @@ shape runs today. ``--compare --update_improved`` applies it after tuning, by
 timing each shape through the operator serving calls with the old and the new
 tuned CSV. A tuner that times the incumbent next to the challengers applies it
 during the search, through ``gate_against_incumbent``.
+
+A search that can say how noisy its own comparison was passes that as a
+``noise_pct`` floor, and the challenger has to clear the larger of the two:
+the minimum improvement says what is worth a row, the noise says what was
+actually resolved. ``standard_error_bar`` gives that floor for finalists timed
+over repeated rounds; a race uses its indifference zone.
 """
 
 import math
@@ -75,6 +81,64 @@ class PromotionPolicy:
 
 DEFAULT_PROMOTION = PromotionPolicy()
 
+
+@dataclass(frozen=True)
+class FinalistPolicy:
+    """How an exhaustive search re-times its fastest candidates."""
+
+    # Screening keeps this many of the fastest candidates per shape, and times
+    # them again this many times, before the winner is chosen.
+    finalists: int = 8
+    rounds: int = 3
+    # The challenger must also be faster than the incumbent by this many
+    # combined standard errors of the round means; two is the conventional
+    # ~95% two-sample separation.
+    significance_sigma: float = 2.0
+
+    def __post_init__(self):
+        if self.finalists < 1 or self.rounds < 1:
+            raise ValueError("finalists and rounds must be at least 1")
+        if not self.significance_sigma > 0.0:
+            raise ValueError(
+                f"significance_sigma must be positive, got {self.significance_sigma}"
+            )
+
+
+DEFAULT_FINALISTS = FinalistPolicy()
+
+
+@dataclass(frozen=True)
+class RacePolicy:
+    """How an interleaved elimination race spends its measurements.
+
+    The race's indifference zone is ``PromotionPolicy.min_improvement_pct``
+    unless a caller narrows or widens it, so by default the race and the gate
+    after it agree on what a tie is.
+    """
+
+    # Error budget for eliminating a candidate as slower than the leader.
+    alpha: float = 0.05
+    # Timed calls per candidate per block.
+    block_calls: int = 10
+    # Blocks before elimination may start, and at which the race stops
+    # without certifying a winner.
+    min_blocks: int = 3
+    max_blocks: int = 30
+
+    def __post_init__(self):
+        if not 0.0 < self.alpha < 1.0:
+            raise ValueError(f"alpha must be in (0, 1), got {self.alpha}")
+        if self.block_calls < 1:
+            raise ValueError("block_calls must be at least 1")
+        if not 1 <= self.min_blocks <= self.max_blocks:
+            raise ValueError("need 1 <= min_blocks <= max_blocks")
+
+
+DEFAULT_RACE = RacePolicy()
+
+# Seeds candidate sampling and the race's block order, so a run is repeatable.
+SAMPLE_SEED = 20240917
+
 PROMOTE = "promote"
 RETAIN = "retain"
 
@@ -85,6 +149,9 @@ class GateDecision:
     # 100 * (incumbent - challenger) / incumbent; None when there was no
     # incumbent latency to compare against.
     margin_pct: float | None
+    # The margin the challenger had to reach: the larger of the minimum
+    # improvement and the noise floor. None when there was no incumbent.
+    bar_pct: float | None = None
 
 
 def _measured(latency_us) -> bool:
@@ -95,10 +162,29 @@ def _measured(latency_us) -> bool:
     )
 
 
+def standard_error_bar(
+    incumbent_us: float | None,
+    combined_standard_error_us: float,
+    policy: FinalistPolicy = DEFAULT_FINALISTS,
+) -> float:
+    """The margin, in percent of the incumbent, that clears
+    ``policy.significance_sigma`` standard errors, where the combined standard
+    error is that of the two candidates' round means (``math.hypot`` of each)."""
+    if not _measured(incumbent_us):
+        return 0.0
+    return (
+        100.0
+        * policy.significance_sigma
+        * combined_standard_error_us
+        / float(incumbent_us)
+    )
+
+
 def gate_against_incumbent(
     incumbent_us: float | None,
     challenger_us: float,
     policy: PromotionPolicy = DEFAULT_PROMOTION,
+    noise_pct: float | None = None,
 ) -> GateDecision:
     """Decide whether a challenger replaces the incumbent for one shape.
 
@@ -106,6 +192,9 @@ def gate_against_incumbent(
     or the operator's own choice when there is none. With no usable incumbent
     latency there is nothing to protect, so the challenger is promoted and the
     missing margin tells the caller the improvement is unverified.
+
+    ``noise_pct`` raises the bar to what the caller's measurement could
+    resolve, never lowers it below ``policy.min_improvement_pct``.
     """
     if not _measured(challenger_us):
         raise ValueError(f"challenger latency must be positive, got {challenger_us}")
@@ -113,5 +202,6 @@ def gate_against_incumbent(
         return GateDecision(PROMOTE, None)
     incumbent_us = float(incumbent_us)
     margin_pct = (incumbent_us - float(challenger_us)) / incumbent_us * 100.0
-    outcome = PROMOTE if margin_pct >= policy.min_improvement_pct else RETAIN
-    return GateDecision(outcome, margin_pct)
+    bar_pct = max(policy.min_improvement_pct, noise_pct or 0.0)
+    outcome = PROMOTE if margin_pct >= bar_pct else RETAIN
+    return GateDecision(outcome, margin_pct, bar_pct)

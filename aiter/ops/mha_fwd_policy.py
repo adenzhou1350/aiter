@@ -19,7 +19,7 @@ from itertools import product
 from typing import Any, Literal
 
 from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
-from ..utility.tuning_policy import DEFAULT_PROMOTION, DEFAULT_RACE
+from ..utility.tuning_policy import DEFAULT_FINALISTS, DEFAULT_PROMOTION, DEFAULT_RACE
 
 # ---------------------------------------------------------------------------
 # Family identity, stated once for the tuner and the tuning-test tables.
@@ -520,10 +520,12 @@ MHA_FWD_ERROR_ATOL = 2e-2
 MHA_FWD_MAX_ERROR_RATIO = 0.0
 MHA_FWD_TASK_TIMEOUT_S = 7200
 
-# What a challenger must beat and how a race spends its measurements say
-# nothing about attention, so they come from the shared tuning policy. Override
-# a value here with dataclasses.replace if this family ever needs its own.
+# What a challenger must beat, and how finalists and a race spend their
+# measurements, say nothing about attention, so they come from the shared
+# tuning policy. Override a value here with dataclasses.replace if this family
+# ever needs its own.
 MHA_FWD_PROMOTION = DEFAULT_PROMOTION
+MHA_FWD_FINALISTS = DEFAULT_FINALISTS
 MHA_FWD_RACE = DEFAULT_RACE
 
 

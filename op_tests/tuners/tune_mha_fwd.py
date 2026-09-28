@@ -11,6 +11,7 @@ the published row is the incumbent a challenger has to beat.
 """
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -48,6 +49,7 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_ERROR_METRIC,
     MHA_FWD_ERROR_RTOL,
     MHA_FWD_FAMILY,
+    MHA_FWD_FINALISTS,
     MHA_FWD_MAX_ERROR_RATIO,
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
@@ -78,6 +80,7 @@ from aiter.utility.mp_tuner import MpTunerTask, mp_tuner
 from aiter.utility.tuning_policy import (
     RETAIN,
     SAMPLE_SEED,
+    PromotionPolicy,
     gate_against_incumbent,
     standard_error_bar,
 )
@@ -403,7 +406,8 @@ class MhaFwdTuner(TunerCommon):
         "errRatio": MHA_FWD_MAX_ERROR_RATIO,
         "timeout": MHA_FWD_TASK_TIMEOUT_S,
         "config_env_name": MHA_FWD_CONFIG_ENV,
-        "finalist_rounds": MHA_FWD_PROMOTION.finalist_rounds,
+        "finalist_rounds": MHA_FWD_FINALISTS.rounds,
+        "min_improvement_pct": MHA_FWD_PROMOTION.min_improvement_pct,
     }
     # errRatio is the fraction of output elements outside these tolerances.
     ERROR_METRIC = MHA_FWD_ERROR_METRIC
@@ -456,7 +460,10 @@ class MhaFwdTuner(TunerCommon):
             "--finalist-rounds",
             type=int,
             default=self.get_arg_defaults()["finalist_rounds"],
-            help="fresh-worker measurement rounds for each top-eight finalist",
+            help=(
+                f"fresh-worker measurement rounds for each of the "
+                f"{MHA_FWD_FINALISTS.finalists} fastest candidates"
+            ),
         )
         self.parser.add_argument(
             "--strategy",
@@ -472,13 +479,14 @@ class MhaFwdTuner(TunerCommon):
         self.parser.add_argument(
             "--delta",
             type=float,
-            default=MHA_FWD_PROMOTION.indifference_delta,
+            default=None,
             help=(
-                "race only: the indifference zone. Candidates within this of "
-                "the leader are treated as settled rather than as a harder "
-                "question, and the same threshold decides whether a challenger "
-                "displaces the incumbent, so one definition of "
-                "indistinguishable holds end to end"
+                "race only: the indifference zone, as a fraction (default: "
+                "--min_improvement_pct / 100). Candidates within this of the "
+                "leader are treated as settled rather than as a harder "
+                "question. A challenger has to clear the larger of this and "
+                "--min_improvement_pct to displace the incumbent, so the gate "
+                "never promotes a gap the race did not resolve"
             ),
         )
         self.parser.add_argument(
@@ -563,6 +571,10 @@ class MhaFwdTuner(TunerCommon):
     def pre_process(self, args):
         if args.finalist_rounds < 1:
             raise ValueError("--finalist-rounds must be positive")
+        if getattr(args, "delta", None) is None:
+            args.delta = self._promotion_policy(args).min_improvement_pct / 100.0
+        if not 0.0 <= args.delta < 1.0:
+            raise ValueError("--delta must be a fraction in [0, 1)")
         if not args.untune_file or not os.path.isfile(args.untune_file):
             raise FileNotFoundError(f"MHA problem CSV not found: {args.untune_file}")
         frame = pd.read_csv(args.untune_file)
@@ -1020,7 +1032,7 @@ class MhaFwdTuner(TunerCommon):
                 for result in sorted(
                     finalists_by_key.get(self.lookup_key(row), ()),
                     key=lambda item: item[1],
-                )[: MHA_FWD_PROMOTION.finalists]
+                )[: MHA_FWD_FINALISTS.finalists]
             )
         if not finalist_infos:
             return first_pass
@@ -1576,7 +1588,10 @@ class MhaFwdTuner(TunerCommon):
         incumbents = self._incumbents_by_key.get(key, set())
         if (fastest["backend"], fastest["backend_config"]) in incumbents:
             fastest["detail"] = "incumbent retained: nothing measured beat it"
-            self._record_promotion(key, fastest, fastest, 0.0, 0.0, "incumbent_fastest")
+            tie = gate_against_incumbent(
+                float(fastest["us"]), float(fastest["us"]), self._promotion_policy()
+            )
+            self._record_promotion(key, fastest, fastest, "incumbent_fastest", tie)
             return fastest
 
         measured = valid[
@@ -1588,23 +1603,26 @@ class MhaFwdTuner(TunerCommon):
             return self._gate_against_autoselect(key, fastest)
 
         incumbent = measured.iloc[0]
-        noise = self._indifference_threshold(fastest, incumbent)
+        noise = self._noise_floor_pct(fastest, incumbent)
         decision = gate_against_incumbent(
-            float(incumbent["us"]), float(fastest["us"]), MHA_FWD_PROMOTION, bar=noise
+            float(incumbent["us"]),
+            float(fastest["us"]),
+            self._promotion_policy(),
+            noise_pct=noise,
         )
-        margin = decision.margin
+        margin, bar = decision.margin_pct, decision.bar_pct
         if decision.outcome == RETAIN:
             kept = incumbent.copy()
             kept["detail"] = (
-                f"incumbent retained: winner was {margin:+.2%} against "
-                f"{noise:.2%} measurement spread"
+                f"incumbent retained: winner was {margin:+.2f}% against a "
+                f"{bar:.2f}% bar"
             )
             self._record_promotion(
-                key, fastest, incumbent, margin, noise, "within_noise"
+                key, fastest, incumbent, "below_bar", decision, noise
             )
             return kept
-        fastest["detail"] = f"beat incumbent by {margin:.2%} against {noise:.2%} spread"
-        self._record_promotion(key, fastest, incumbent, margin, noise, "promoted")
+        fastest["detail"] = f"beat incumbent by {margin:.2f}% against a {bar:.2f}% bar"
+        self._record_promotion(key, fastest, incumbent, "promoted", decision, noise)
         return fastest
 
     def _gate_against_autoselect(self, key, fastest):
@@ -1613,8 +1631,8 @@ class MhaFwdTuner(TunerCommon):
         asm_v3 leaves its split count to C++, which reports 0, and 0 is not a
         legal candidate split, so the shipped configuration cannot be entered
         in the field and is timed by the fresh probe instead. One probe
-        latency carries no round spread, so the bar is the fixed indifference
-        delta rather than a standard-error separation.
+        latency carries no round spread, so there is no standard-error floor;
+        a race still contributes its delta.
 
         Returning None leaves the table as it stands. For a shape with no row
         that means auto-select, which is how it reaches auto-select in the
@@ -1625,19 +1643,21 @@ class MhaFwdTuner(TunerCommon):
             key
         ) or self._autoselect_by_key.get(key)
         latency = None if selection is None else selection.get("latency_us")
-        noise = self._delta()
+        noise = self._race_floor_pct()
         decision = gate_against_incumbent(
-            latency, float(fastest["us"]), MHA_FWD_PROMOTION, bar=noise
+            latency, float(fastest["us"]), self._promotion_policy(), noise_pct=noise
         )
-        if decision.margin is None:
+        if decision.margin_pct is None:
             fastest["detail"] = "incumbent not measured; improvement unverified"
-            self._record_promotion(key, fastest, None, None, None, "incumbent_absent")
+            self._record_promotion(
+                key, fastest, None, "incumbent_absent", decision, noise
+            )
             return fastest
 
         latency = float(latency)
         backend = selection["identity"][0]
         baseline = {"backend": backend, "backend_config": "", "us": latency}
-        margin = decision.margin
+        margin, bar_pct = decision.margin_pct, decision.bar_pct
         has_row = key in self._published_by_key
         # A published row that did not resolve was replaced by auto-select as
         # the incumbent, so that is what was gated against.
@@ -1646,7 +1666,7 @@ class MhaFwdTuner(TunerCommon):
         if decision.outcome == RETAIN:
             print(
                 f"leaving {key} on {bar}: {backend} at {latency:.1f} us "
-                f"was not beaten by {noise:.2%}",
+                f"was not beaten by {bar_pct:.2f}%",
                 flush=True,
             )
             if has_row and not retuning:
@@ -1661,38 +1681,55 @@ class MhaFwdTuner(TunerCommon):
                 key,
                 fastest,
                 baseline,
-                margin,
-                noise,
                 "incumbent_retained" if retuning else "autoselect_retained",
+                decision,
+                noise,
             )
             return None
         fastest["detail"] = (
-            f"beat {bar} {backend} by {margin:.2%} against {noise:.2%} spread"
+            f"beat {bar} {backend} by {margin:.2f}% against a {bar_pct:.2f}% bar"
         )
-        self._record_promotion(key, fastest, baseline, margin, noise, "promoted")
+        self._record_promotion(key, fastest, baseline, "promoted", decision, noise)
         return fastest
 
-    def _indifference_threshold(self, challenger, incumbent) -> float:
-        """The relative margin a challenger must beat the incumbent by.
+    def _promotion_policy(self, args=None) -> PromotionPolicy:
+        """The family's promotion policy, with --min_improvement_pct applied,
+        so one flag sets the bar for both the search and --compare."""
+        args = args if args is not None else getattr(self, "_args", None)
+        pct = getattr(args, "min_improvement_pct", None)
+        if pct is None:
+            return MHA_FWD_PROMOTION
+        return dataclasses.replace(MHA_FWD_PROMOTION, min_improvement_pct=float(pct))
 
-        Under ``--strategy race``, delta. Otherwise twice the combined
-        standard error of the two candidates' finalist rounds, as a fraction
-        of the incumbent's latency: a two-sample separation at roughly 95%.
+    def _noise_floor_pct(self, challenger, incumbent) -> float | None:
+        """How far apart this run could tell two candidates, in percent.
+
+        Under ``--strategy race``, the race's delta. Otherwise twice the
+        combined standard error of the two candidates' finalist rounds: a
+        two-sample separation at roughly 95%.
         """
-        args = getattr(self, "_args", None)
-        if getattr(args, "strategy", "exhaustive") == "race":
-            return self._delta()
+        if getattr(getattr(self, "_args", None), "strategy", "exhaustive") == "race":
+            return self._race_floor_pct()
         combined_se = math.hypot(
             self._standard_error_us(challenger), self._standard_error_us(incumbent)
         )
         return standard_error_bar(
-            float(incumbent["us"]), combined_se, MHA_FWD_PROMOTION
+            float(incumbent["us"]), combined_se, MHA_FWD_FINALISTS
         )
 
+    def _race_floor_pct(self) -> float | None:
+        """The race's delta in percent, or None when no race was run."""
+        if getattr(getattr(self, "_args", None), "strategy", "exhaustive") != "race":
+            return None
+        return 100.0 * self._delta()
+
     def _delta(self) -> float:
-        """The indifference delta this run uses: --delta, or the policy's."""
-        args = getattr(self, "_args", None)
-        return float(getattr(args, "delta", MHA_FWD_PROMOTION.indifference_delta))
+        """The race's indifference zone as a fraction: --delta, or the minimum
+        improvement."""
+        delta = getattr(getattr(self, "_args", None), "delta", None)
+        if delta is not None:
+            return float(delta)
+        return self._promotion_policy().min_improvement_pct / 100.0
 
     def _race_pick(self, key, valid):
         """The row the race certified, or the fastest one if no race was run.
@@ -1724,16 +1761,22 @@ class MhaFwdTuner(TunerCommon):
             )
         return match.iloc[0].copy()
 
-    def _record_promotion(self, key, challenger, incumbent, margin, noise, decision):
+    def _record_promotion(
+        self, key, challenger, incumbent, label, decision=None, noise=None
+    ):
         """Keep why each shape was or was not retuned, for the evidence file.
 
         Without it a reader of the published table cannot tell a measured
         improvement from a tie that happened to sort first.
         """
+
+        def pct(value):
+            return None if value is None else round(float(value), 4)
+
         self._promotions.append(
             {
                 "key": list(key) if isinstance(key, tuple) else key,
-                "decision": decision,
+                "decision": label,
                 "challenger": {
                     "backend": challenger["backend"],
                     "backend_config": challenger["backend_config"],
@@ -1748,8 +1791,9 @@ class MhaFwdTuner(TunerCommon):
                         "us": float(incumbent["us"]),
                     }
                 ),
-                "margin": None if margin is None else round(float(margin), 6),
-                "measurement_spread": None if noise is None else round(float(noise), 6),
+                "margin_pct": pct(None if decision is None else decision.margin_pct),
+                "bar_pct": pct(None if decision is None else decision.bar_pct),
+                "noise_floor_pct": pct(noise),
             }
         )
 
@@ -2107,7 +2151,7 @@ class MhaFwdTuner(TunerCommon):
             "measurement": {
                 "warmup": int(self._args.warmup),
                 "iterations": int(self._args.iters),
-                "finalists": MHA_FWD_PROMOTION.finalists,
+                "finalists": MHA_FWD_FINALISTS.finalists,
                 "finalist_rounds": int(self._args.finalist_rounds),
                 "statistic": "median of finalist round means",
                 "rtol": self.ERROR_RTOL,
@@ -2137,12 +2181,19 @@ class MhaFwdTuner(TunerCommon):
             "restricted_backends": self._restricted_backends(),
             "promotions": self._promotions,
             # What the gate actually compared against, rather than what a
-            # reader would have to infer from the strategy name.
-            "indifference_threshold": (
-                self._delta()
-                if getattr(self._args, "strategy", "") == "race"
-                else f"{MHA_FWD_PROMOTION.significance_sigma} x combined standard error"
-            ),
+            # reader would have to infer from the strategy name. Each
+            # promotion records the bar it applied.
+            "promotion_bar": {
+                "min_improvement_pct": self._promotion_policy().min_improvement_pct,
+                "noise_floor": (
+                    f"race delta {self._delta():.2%}"
+                    if getattr(self._args, "strategy", "") == "race"
+                    else (
+                        f"{MHA_FWD_FINALISTS.significance_sigma} x combined "
+                        "standard error of the finalist rounds"
+                    )
+                ),
+            },
             "races": self._race_reports,
             "coverage_limits": [
                 (

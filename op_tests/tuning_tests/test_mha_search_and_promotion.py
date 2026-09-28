@@ -168,8 +168,8 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertIn("beat auto-select opus", winner["detail"])
         self.assertEqual(tuner._promotions[0]["decision"], "promoted")
 
-    def test_an_auto_select_win_inside_delta_still_publishes_no_row(self):
-        """1% against a 2% indifference delta is not a result. Publishing it
+    def test_an_auto_select_win_below_the_bar_still_publishes_no_row(self):
+        """1% against a 3% minimum improvement is not a result. Publishing it
         would pin a configuration that is indistinguishable from the one the
         shape already reaches without any row at all."""
         tuner = self._tuner()
@@ -190,8 +190,31 @@ class TestIncumbentGate(unittest.TestCase):
         )
         record = tuner._promotions[0]
         self.assertEqual(record["decision"], "promoted")
-        self.assertAlmostEqual(record["margin"], 0.2, places=6)
+        self.assertAlmostEqual(record["margin_pct"], 20.0, places=4)
+        self.assertAlmostEqual(record["bar_pct"], 3.0, places=4)
         self.assertEqual(record["incumbent"]["us"], 1000.0)
+
+    def test_a_resolved_but_small_win_is_not_worth_a_row(self):
+        """Tight finalist rounds resolve a 1% gap, far above two standard
+        errors, but it is below the minimum improvement --compare would
+        demand, so publishing it would only churn the table."""
+        tuner = self._tuner()
+        winner = tuner._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=990.0, incumbent_us=1000.0)
+        )
+        self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
+        record = tuner._promotions[0]
+        self.assertEqual(record["decision"], "below_bar")
+        self.assertLess(record["noise_floor_pct"], 1.0)
+        self.assertAlmostEqual(record["bar_pct"], 3.0, places=4)
+
+    def test_min_improvement_pct_sets_the_search_bar_too(self):
+        tuner = self._tuner()
+        tuner._args = types.SimpleNamespace(min_improvement_pct=0.5)
+        winner = tuner._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=990.0, incumbent_us=1000.0)
+        )
+        self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
 
 
 class TestIncumbentIdentity(unittest.TestCase):
