@@ -34,7 +34,7 @@ under the relevant phase as evidence.
 
 ## Progress
 
-- [ ] 1. K2 correctness (4 GiB pages, empty-tile NaN, output layout, Q over-read, empty tables)
+- [x] 1. K2 correctness (4 GiB pages, empty-tile NaN, output layout, Q over-read, empty tables)
 - [ ] 2. K1 page faults (prefill over-read, decode page ids, K1 4 GiB / i32)
 - [ ] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
 - [ ] 4. Score-matrix scope, benches, and stronger K1 assertions
@@ -255,13 +255,14 @@ counted separately. All five are still in `k2.py`.
       | 1 | 32768 | 12.17 | 12.31 |
       | 8 | 32768 | 18.97 | 18.50 |
       | 512 | 8192 | 264.42 | 263.49 |
-- [ ] **1e. Empty page table or cache.** `qsa_k2_serves` does not reject
-      a zero-page cache or a zero-width table. The early return (~1230)
-      covers only zero rows or a zero-width index list. Safe indices
-      clamp to 0 and the gather still loads. Reject, or return zeros
-      before launch, when the cache or the table has no pages and the
-      index list is nonempty. `test_*` covers both geometries. No bar
-      re-time beyond a smoke call: the hot path is unchanged.
+- [x] **1e. Empty page table or cache.** A nonempty index list with
+      `k_cache.shape[0] == 0` or `page_table.shape[1] == 0` returns
+      zeros before launch, next to the empty-query return. No table
+      scan and no tile-loop branch.
+      `test_k2_empty_cache_or_table_returns_zeros` saw a launch on the
+      unfixed tree for both geometries and now gets zeros without one.
+      The family A decode oracle is the smoke call; the kernel is
+      unchanged, so the bar shapes were not re-timed.
 
 ### 2. K1 page faults
 
