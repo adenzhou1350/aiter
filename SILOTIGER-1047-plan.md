@@ -1065,14 +1065,98 @@ decode ISA still reused ``v[96:99]`` / ``v[98:99]``. Split-only
 merge ``vmcnt(31)`` ladder). Kernel restored. Inline-asm dest pins
 stay parent DNR.
 
-- [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
+- [x] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`, cold `--rotate 0`.
+Group 5, `Hq=10`, `D=128`, width 2051. `err=0` at `1e-2` on every row,
+including the published `M=16` point. Every row beats #4882 Triton and
+Gluon. The same grid also beats live AMD; that column is not required
+by this line. `L=512` is mostly padding (`valid%` 12–25).
+
+vs #4882 Triton and Gluon:
+
+| M | L | valid% | FlyDSL µs | Triton µs | Gluon µs | vs Triton | vs Gluon |
+|--:|--:|-------:|----------:|----------:|---------:|----------:|---------:|
+| 1 | 512 | 25.0 | 8.10 | 100.64 | 83.37 | 0.08× | 0.10× |
+| 1 | 2048 | 99.9 | 8.76 | 101.96 | 90.51 | 0.09× | 0.10× |
+| 1 | 8192 | 99.9 | 10.13 | 140.42 | 106.15 | 0.07× | 0.10× |
+| 1 | 32768 | 99.9 | 10.14 | 148.36 | 113.35 | 0.07× | 0.09× |
+| 8 | 512 | 24.8 | 11.61 | 102.65 | 83.15 | 0.11× | 0.14× |
+| 8 | 2048 | 99.7 | 12.37 | 105.38 | 92.14 | 0.12× | 0.13× |
+| 8 | 8192 | 99.9 | 13.24 | 132.67 | 103.96 | 0.10× | 0.13× |
+| 8 | 32768 | 99.9 | 13.40 | 155.90 | 110.09 | 0.09× | 0.12× |
+| 16 | 512 | 24.6 | 13.82 | 102.10 | 82.63 | 0.14× | 0.17× |
+| 16 | 2048 | 99.5 | 15.05 | 107.02 | 92.77 | 0.14× | 0.16× |
+| 16 | 8192 | 99.9 | 15.87 | 125.49 | 101.31 | 0.13× | 0.16× |
+| 16 | 32768 | 99.9 | 16.60 | 137.68 | 107.04 | 0.12× | 0.16× |
+| 512 | 512 | 12.5 | 106.33 | 173.67 | 175.81 | 0.61× | 0.60× |
+| 512 | 2048 | 87.4 | 131.37 | 177.85 | 188.41 | 0.74× | 0.70× |
+| 512 | 8192 | 99.9 | 137.80 | 191.36 | 210.82 | 0.72× | 0.65× |
+| 512 | 32768 | 99.9 | 142.69 | 200.24 | 222.35 | 0.71× | 0.64× |
+
+vs live AMD, same shapes, `err=0` on both sides:
+
+| M | L | FlyDSL µs | live AMD µs | vs AMD |
+|--:|--:|----------:|------------:|-------:|
+| 1 | 512 | 7.86 | 14.35 | 0.55× |
+| 1 | 2048 | 9.24 | 14.76 | 0.63× |
+| 1 | 8192 | 9.60 | 15.32 | 0.63× |
+| 1 | 32768 | 10.26 | 15.86 | 0.65× |
+| 8 | 512 | 11.49 | 28.37 | 0.40× |
+| 8 | 2048 | 12.40 | 29.54 | 0.42× |
+| 8 | 8192 | 13.31 | 30.89 | 0.43× |
+| 8 | 32768 | 13.68 | 31.46 | 0.43× |
+| 16 | 512 | 13.88 | 20.30 | 0.68× |
+| 16 | 2048 | 15.12 | 21.29 | 0.71× |
+| 16 | 8192 | 16.01 | 22.71 | 0.70× |
+| 16 | 32768 | 16.46 | 23.16 | 0.71× |
+| 512 | 512 | 106.24 | 146.33 | 0.73× |
+| 512 | 2048 | 131.75 | 148.64 | 0.89× |
+| 512 | 8192 | 138.57 | 153.36 | 0.90× |
+| 512 | 32768 | 143.37 | 156.69 | 0.91× |
+
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
       kernel if occupancy suffers.
-- [ ] **Done when:** GQA `err` vs oracle is within the documented tol; family A
+- [x] **Done when:** GQA `err` vs oracle is within the documented tol; family A
       beats live AMD sparse GQA and #4882 Triton; family B beats #4882 Triton
       and Gluon on the published points. Do **not** cite the group-5 Gluon
       number as a family A GQA win.
+
+Judged on the locked bar shapes, not on every harness row. GPU 6 /
+gfx950 / cold cache. Family A `err=0`. The three bar points beat live
+AMD and #4882 Triton:
+
+| M | L | valid% | FlyDSL µs | live AMD µs | #4882 µs | vs AMD | vs #4882 |
+|--:|--:|-------:|----------:|------------:|---------:|-------:|---------:|
+| 1 | 32768 | 99.9 | 11.94 | 12.59 | 170.22 | 0.95× | 0.07× |
+| 8 | 32768 | 99.9 | 17.24 | 20.69 | 166.32 | 0.83× | 0.10× |
+| 512 | 8192 | 99.9 | 240.06 | 249.60 | 262.95 | 0.96× | 0.91× |
+
+Four family A rows are slower than live AMD and still beat #4882.
+`L=512` is the smoke row. `M=8` at `L=2048` is 16.30 vs 16.16 µs
+(1.01×). `M=512` at `L=2048` is 226.16 vs 219.90 µs (1.03×, `valid%`
+87.4). `M=1` at `L=512` is 1.05× and `M=8` at `L=512` is 1.03×.
+
+Full family A harness, same run:
+
+| M | L | valid% | FlyDSL µs | live AMD µs | #4882 µs | vs AMD | vs #4882 |
+|--:|--:|-------:|----------:|------------:|---------:|-------:|---------:|
+| 1 | 512 | 25.0 | 11.13 | 10.59 | 124.08 | 1.05× | 0.09× |
+| 1 | 2048 | 99.9 | 11.59 | 11.91 | 161.72 | 0.97× | 0.07× |
+| 1 | 8192 | 99.9 | 11.95 | 12.43 | 165.79 | 0.96× | 0.07× |
+| 1 | 32768 | 99.9 | 11.94 | 12.59 | 170.22 | 0.95× | 0.07× |
+| 8 | 512 | 24.8 | 14.37 | 13.93 | 125.86 | 1.03× | 0.11× |
+| 8 | 2048 | 99.7 | 16.30 | 16.16 | 139.40 | 1.01× | 0.12× |
+| 8 | 8192 | 99.9 | 16.93 | 19.88 | 155.16 | 0.85× | 0.11× |
+| 8 | 32768 | 99.9 | 17.24 | 20.69 | 166.32 | 0.83× | 0.10× |
+| 512 | 512 | 12.5 | 162.63 | 211.76 | 231.26 | 0.77× | 0.70× |
+| 512 | 2048 | 87.4 | 226.16 | 219.90 | 241.25 | 1.03× | 0.94× |
+| 512 | 8192 | 99.9 | 240.06 | 249.60 | 262.95 | 0.96× | 0.91× |
+| 512 | 32768 | 99.9 | 278.15 | 288.35 | 283.91 | 0.96× | 0.98× |
+
+Phase 3 stays open: gfx942 is unmeasured, and 3d is the superseded
+`BLOCK_N=16` kernel. Sigmoid stays outside K2 until phase 5.
 
 ### 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
 
