@@ -35,7 +35,7 @@ under the relevant phase as evidence.
 ## Progress
 
 - [x] 1. K2 correctness (4 GiB pages, empty-tile NaN, output layout, Q over-read, empty tables)
-- [ ] 2. K1 page faults (prefill over-read, decode page ids, K1 4 GiB / i32)
+- [x] 2. K1 page faults (prefill over-read, decode page ids, K1 4 GiB / i32)
 - [ ] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
 - [ ] 4. Score-matrix scope, benches, and stronger K1 assertions
 - [ ] 5. Behavior-preserving kernel cleanup
@@ -311,11 +311,26 @@ them, and fix the ones that are real. Do not change score math.
       |--:|--:|----------:|---------:|
       | 1 | 32768 | 15.08 | 15.00 |
       | 8 | 32768 | 20.45 | 20.37 |
-- [ ] **2c. K1 4 GiB cache.** Same 32-bit descriptor class as 1a, on
-      `k_buf` in both scorers (~203, ~425). Apply the 1a page-local
-      descriptor. If 1a's helper is shared, use it; do not invent a
-      second addressing scheme. Re-time only if the scorer source
-      changed.
+- [x] **2c. K1 4 GiB cache.** 1a's helper is closed over inside the
+      K2 kernel, so both K1 scorers use the same scheme rather than a
+      shared function: a cache that fits in 4 GiB keeps one whole-cache
+      descriptor, and a larger cache is a separate compile that rebases
+      each gathered row in 64-bit and then covers only that row.
+      `test_k1_page_past_4gib`: physical page 1048576 starts at 4 GiB
+      and holds ones; every other logical page is zeros. On the unfixed
+      tree M=4 selected page 0's blocks. After the fix M=4 (one-row
+      scorer) and M=32 (prefill scorer) match the oracle. The fast-path
+      two-tile and prefill set-equality tests stay green.
+
+      GPU 6, cold `--rotate 0`, `CACHE=0`, control taken immediately
+      before the candidate. These shapes fit in 4 GiB, so they take the
+      whole-cache compile:
+
+      | M | L | before µs | after µs |
+      |--:|--:|----------:|---------:|
+      | 1 | 32768 | 14.58 | 15.15 |
+      | 8 | 32768 | 19.25 | 20.62 |
+      | 512 | 8192 | 31.21 | 29.94 |
 - [ ] **2d. i32 score-store index.** Not verified. Check whether
       `M * n_columns >= 2^31` (the review's example is `16384 × 131072`)
       overflows the store index. If the serving shapes cannot reach it,
