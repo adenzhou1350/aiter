@@ -36,7 +36,7 @@ under the relevant phase as evidence.
 
 - [x] 1. K2 correctness (4 GiB pages, empty-tile NaN, output layout, Q over-read, empty tables)
 - [x] 2. K1 page faults (prefill over-read, decode page ids, K1 4 GiB / i32)
-- [ ] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
+- [x] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
 - [ ] 4. Score-matrix scope, benches, and stronger K1 assertions
 - [ ] 5. Behavior-preserving kernel cleanup
 - [ ] 6. QSA AOT registration
@@ -359,15 +359,23 @@ and does not prove the LDS budget.
       with `gfx942 H=8 still dispatches the 16-row tile` and passes
       after. `test_k1_family_a_set_equality_prefill` still passes on
       this gfx950 box.
-- [ ] **3b. Runtime arch allowlist.** Both wrappers treat every device
-      whose name does not start with `gfx950` as the gfx942 path
-      (`k2.py` ~1240, `k1.py` ~638). `topk_select` gates on
-      build-environment `get_gfx()`, not `q.device`. Allowlist
-      `gfx942` and `gfx950` from `q.device` in the QSA wrappers and
-      raise otherwise. Do not change the selector's global gate.
-      `test_*`: a mocked or CPU-side check is not required; a direct
-      unit of the allowlist helper is enough if it does not need a
-      second GPU.
+- [x] **3b. Runtime arch allowlist.** Both wrappers treated every
+      device whose name does not start with `gfx950` as the gfx942
+      path. `qsa_device_arch` keeps the ISA token before the first
+      colon and accepts only `gfx942` and `gfx950`. `qsa_k1_block_ids`,
+      `qsa_k1_score_and_select`, and `qsa_k2` call it with
+      `q.device`'s `gcnArchName` before a kernel launch, and the
+      long-row scorer does so again before `topk_select`. K32 stays
+      `arch == "gfx950"`. `topk_select` still gates on `get_gfx()`.
+      `test_qsa_arch_allowlist` failed on the unfixed tree with
+      `No module named 'aiter.ops.flydsl.kernels.qsa.arch'` and passes
+      after. Suffixes such as `gfx942:sramecc+:xnack-` still resolve,
+      and `gfx1100`, `gfx1250`, `gfx90a`, `gfx9420`, and `GFX950` raise.
+      The kernel bodies are unchanged, so the bar shapes were not
+      re-timed. This container's GPU 6 is MI300X gfx942; the live name
+      resolves to gfx942, which is the same tile the old
+      `startswith("gfx950")` test selected. Pytest gate, `CACHE=0`:
+      34 passed.
 
 ### 4. Score-matrix scope, benches, and K1 assertions
 
