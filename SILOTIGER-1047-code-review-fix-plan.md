@@ -331,12 +331,16 @@ them, and fix the ones that are real. Do not change score math.
       | 1 | 32768 | 14.58 | 15.15 |
       | 8 | 32768 | 19.25 | 20.62 |
       | 512 | 8192 | 31.21 | 29.94 |
-- [ ] **2d. i32 score-store index.** Not verified. Check whether
-      `M * n_columns >= 2^31` (the review's example is `16384 × 131072`)
-      overflows the store index. If the serving shapes cannot reach it,
-      record that and stop. If they can, fix the index without widening
-      the hot score path for the bar shapes. Do not switch the bar-shape
-      store to int64 "just in case."
+- [x] **2d. i32 score-store index.** The store is `scores[row, out_col]`.
+      The row stride of that contiguous fp32 matrix is a dynamic i64
+      (tensor strides are i64 unless a kernel asks for 32-bit strides;
+      these scorers do not). The i32 row is widened before the
+      multiply, so `M * n_columns >= 2^31` does not wrap the address.
+      Serving shapes do not reach that product anyway. The harness
+      prefill is at most `M=8192`, and the long context is 128k tokens,
+      which is 32768 indexer blocks. `8192 * 32768 = 2^28`. The
+      review's `16384 × 131072` is twice that `M` and four times that
+      column count. No store change, so the bar shapes were not re-timed.
 
 ### 3. K1 gfx942 H=8 LDS and arch allowlist
 
