@@ -396,13 +396,16 @@ still-open ticket-doc half of "Earlier findings." No kernel change.
       helper's ids match `qsa_k1_block_ids` and its indices match a
       separate expand. No kernel change, so the bar shapes were not
       re-timed.
-- [ ] **4c. Sweep mismatches fail, and requested M is not dropped.**
-      Kernel benches return `err` and `__main__` only logs the table.
-      FlyDSL K1/K2 loops keep `M <= 8` and `M == 512`, so a requested
-      `M` of 64, 2048, or 8192 never appears. Fail the sweep on a
-      nonzero K1 set mismatch and on a K2 `err` above the unit-test
-      tolerance. Run requested `M` values, or log an explicit skip
-      that names the kernel's supported band. Do not silently `continue`.
+- [x] **4c. Sweep mismatches fail, and requested M is not dropped.**
+      Family A K1/K2 report `M<=8` as decode and every larger requested
+      M, including 64, 2048, and 8192, as prefill. Family B K1 runs
+      every requested M in the emit or long-L table for that `L`.
+      `M > L` is logged. A nonzero `flydsl_k1 err` and a `flydsl_k2 err`
+      above the unit tolerance (`checkAllclose` rtol=1e-2 atol=1e-2,
+      so `err != 0`) raise. `test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch`
+      checks the decode/prefill split and that a nonzero K1 or K2 err
+      raises. No kernel change, so the bar shapes were not re-timed.
+      The HIP-graph table is still decode `M<=8`.
 - [ ] **4d. Stronger K1 assertions.** `_set_mismatch_ratio` compares
       sets and ignores duplicates and order. On the existing K1 unit
       cases, also require no duplicate ids and a compact valid prefix
