@@ -132,7 +132,7 @@ Fusing top-k may change fp32 score order vs materializing full logits; gate K1 o
 ## Phases
 
 1. Harness: pin **vLLM AMD live path**, #4882 Triton, #4882 Gluon (where it dispatches), and a fp32 oracle. Report family A and family B separately. rocprof one real QSA layer (indexer through GQA) at short and long `L`, including HIP graph replay at decode.
-2. FlyDSL K1 on family A (`H=4`) and family B (`H` is 4 or 8). Gate: beat live vLLM AMD (`MQA Triton + HIP top-k`) and beat #4882 Triton; beat Gluon on gfx950 where Gluon dispatches. No full score matrix.
+2. FlyDSL K1 on family A (`H=4`) and family B (`H` is 4 or 8). Gate: beat live vLLM AMD (`MQA Triton + HIP top-k`) and beat #4882 Triton; beat Gluon on gfx950 where Gluon dispatches. Fused emit writes block ids with no score matrix when `visible <= 512`. Longer rows materialize an `[M, n_blocks]` fp32 score buffer, then select.
 3. FlyDSL K2 on family A (`D=256`, group 12) vs live vLLM AMD sparse GQA and #4882 Triton. Then family B (`D=128`, group 5) vs #4882 Triton **and** Gluon.
 4. Wire `aiter/ops/flydsl/` plus vLLM `qwen4_exp` opt-in, same three-way backend idea as #4882 (`auto` / FlyDSL / Triton).
 5. Optional: fuse `expand+tail` into K2; fuse `qsa_pre_indexer` (`Gemma RMSNorm + partial MRoPE + compress`) only after K1/K2 beat the bar.

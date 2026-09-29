@@ -382,12 +382,11 @@ and does not prove the LDS budget.
 Review should-fix 6, 8, and 9, the "consider" assertion note, and the
 still-open ticket-doc half of "Earlier findings." No kernel change.
 
-- [ ] **4a. Resolve the score-matrix conflict in the ticket.** Long rows
-      still allocate `[M, n_columns]` fp32 (`k1.py` ~636). The parent
-      plan allows that. `SILOTIGER-1047.md` still says K1 writes no full
-      score matrix. Update the ticket dump so it matches the parent
-      lock: fused emit at `visible <= 512`, materialized scores above
-      that. Do not delete the buffer.
+- [x] **4a. Resolve the score-matrix conflict in the ticket.** Phase 2
+      of `SILOTIGER-1047.md` said "No full score matrix." It now matches
+      the parent lock: fused emit writes ids with no score matrix when
+      `visible <= 512`, and longer rows materialize an `[M, n_blocks]`
+      fp32 buffer. The long-row allocation in `k1.py` is unchanged.
 - [ ] **4b. K1 bench timings cover the same work.** `bench_qsa_family_a_k1`
       times `qsa_k1_block_ids` and stops at block ids. The vLLM and
       #4882 columns time `qsa_select_paged_tokens` /
