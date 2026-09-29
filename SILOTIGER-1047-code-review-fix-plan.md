@@ -429,10 +429,16 @@ comment-only, re-time the touched kernel and revert on a loss.
       K and V separately. Decode (BLOCK_N=16) still overlays one tile;
       ``split_kv_lds`` is gfx950 prefill only. The header now says that.
       Docstring only, so the bar shapes were not re-timed.
-- [ ] **5b. Dead K2 values.** `k2.py` ~339 builds a tiled copy and
-      discards it. ~370 discards `make_tiled_copy_B(...).get_slice(lane)`.
-      Remove them if they have no side effect. Leave `qk_a_copy` and
-      `kv_store`; those are used.
+- [x] **5b. Dead K2 values.** The builder built
+      `make_tiled_copy(lds_copy64, ...).get_slice(tid)` and
+      `make_tiled_copy_B(pv_b_atom, ...).get_slice(lane)` and discarded
+      both. Both ops are `Pure`. `pv_wave_mma` only fed the second
+      call, so it went too. `kv_store`, `qk_a_copy`, `lds_copy64`, and
+      `pv_b_atom` stay; those are used.
+      Family A decode and prefill still match the oracle. Paired bar
+      times on GPU 6, cold cache: M=1 L=32768
+      12.25 → 12.25 µs, M=8 18.47 → 18.34 µs, M=512 L=8192
+      264.17 → 262.45 µs. Flat.
 - [ ] **5c. Emit's unused arguments.** The emit kernel takes `q`,
       `k_cache`, `page_table`, and `score_scale` and does not read
       them (`k1.py` ~69). Drop them from the kernel if the launch ABI
