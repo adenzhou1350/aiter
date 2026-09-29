@@ -270,16 +270,26 @@ The K1 tile-extent audit. The prefill fault was reproduced. The decode
 fault, the K1 4 GiB cap, and the i32 score index were not run; verify
 them, and fix the ones that are real. Do not change score math.
 
-- [ ] **2a. Prefill page-table over-read.** `qsa_k1_prefill_scores_kernel`
-      sets `col_live` from `score_col < n_columns` only (~500), loads
-      `page_table[0, logical_page]` unchecked (~504), and applies
-      visibility at the store (~553). The K descriptor is default
-      `max_size=True` (~425). Bound `col_live` by `context_lens[0] / R`
-      and require `phys_live`, with a safe page id, before the load.
-      `test_*`: one request, `M=32`, context 4096, 64 real pages, four
-      padded entries. Pad 0 matches the oracle. Pad `-1` and a huge
-      page id do not fault and do not change the selected set. Re-time
-      the long-row K1 prefill bar point.
+- [x] **2a. Prefill page-table over-read.** The prefill K gather
+      bounds `col_live` by `context_lens[0] / R` and requires
+      `phys_live = (phys >= 0) & (phys < n_cache_blocks)` before the
+      load, using a safe page id. `n_cache_blocks` is passed only on
+      the prefill launch. Score math, the selector, `n_columns`, and
+      the decode scorer are unchanged. The K descriptor is still the
+      default `max_size=True`; the 4 GiB cap is 2c.
+      `test_k1_prefill_padded_page_table`: one request, M=32, context
+      4096, 64 real pages, four padded entries. On the unfixed tree
+      pad `-1` aborted the process at the result read. Pad 0, pad
+      `-1`, and page id 100000 match the oracle after the fix.
+      `test_k1_family_a_set_equality_prefill` stays green.
+
+      GPU 6, cold `--rotate 0`, `CACHE=0`, control taken immediately
+      before the candidate. Long-row prefill, one request, 2048
+      columns, so the prefill scorer ran:
+
+      | M | L | before µs | after µs |
+      |--:|--:|----------:|---------:|
+      | 512 | 8192 | 30.20 | 30.46 |
 - [ ] **2b. Decode page ids.** The one-row scorer masks columns (~259)
       but still loads `page_table[safe_req, logical_page]` with no
       `phys_live` (~263). A dead column reads entry 0. A `-1` there, or
