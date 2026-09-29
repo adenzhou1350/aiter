@@ -347,15 +347,18 @@ them, and fix the ones that are real. Do not change score math.
 Review must-fix 4 and should-fix 7. Source analysis; GPU 6 is gfx950
 and does not prove the LDS budget.
 
-- [ ] **3a. H=8 prefill LDS.** `SharedStorage` for the 16-row scorer
-      (`k1.py` ~380) is Q `16·H·128` bf16 + K `32·128` bf16 + 16 ints
-      + C `H·2·2·64·4` fp32. At `H=8` that is 73,792 bytes, over the
-      65,536-byte gfx942 budget. `H=4` fits. Dispatch is still "one
-      request and `M >= 16`" (~642) on every arch. Route gfx942 H=8
-      to the one-row scorer, or shrink only that gfx942 tile. gfx950
-      H=8 prefill stays on the current builder. Static check: the
-      gfx950 H=8 tile size is unchanged. Re-time gfx950 H=8 prefill
-      only if that builder's source changed; it should not have.
+- [x] **3a. H=8 prefill LDS.** The 16-row tile is Q `16·H·128` bf16
+      + K `32·128` bf16 + 16 int32s + C `H·2·2·64·4` fp32. At `H=8`
+      that is 73,792 bytes, over gfx942's 65,536. `H=4` is 41,024 and
+      fits. The one-row tile does not grow with `H` (Q is 16-wide, C
+      is reused per head), so gfx942 `H=8` now takes that scorer.
+      gfx950 `H=8` still takes the 16-row builder, and that builder's
+      source is unchanged (`block_m = 16`, `block_n = 32`), so the
+      gfx950 prefill bar was not re-timed.
+      `test_k1_gfx942_h8_skips_prefill_tile` failed on the old dispatch
+      with `gfx942 H=8 still dispatches the 16-row tile` and passes
+      after. `test_k1_family_a_set_equality_prefill` still passes on
+      this gfx950 box.
 - [ ] **3b. Runtime arch allowlist.** Both wrappers treat every device
       whose name does not start with `gfx950` as the gfx942 path
       (`k2.py` ~1240, `k1.py` ~638). `topk_select` gates on
