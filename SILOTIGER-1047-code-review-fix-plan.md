@@ -37,7 +37,7 @@ under the relevant phase as evidence.
 - [x] 1. K2 correctness (4 GiB pages, empty-tile NaN, output layout, Q over-read, empty tables)
 - [x] 2. K1 page faults (prefill over-read, decode page ids, K1 4 GiB / i32)
 - [x] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
-- [ ] 4. Score-matrix scope, benches, and stronger K1 assertions
+- [x] 4. Score-matrix scope, benches, and stronger K1 assertions
 - [ ] 5. Behavior-preserving kernel cleanup
 - [ ] 6. QSA AOT registration
 - [ ] 7. Optional: caller-owned K2 split workspace, only if a profile says so
@@ -406,10 +406,16 @@ still-open ticket-doc half of "Earlier findings." No kernel change.
       checks the decode/prefill split and that a nonzero K1 or K2 err
       raises. No kernel change, so the bar shapes were not re-timed.
       The HIP-graph table is still decode `M<=8`.
-- [ ] **4d. Stronger K1 assertions.** `_set_mismatch_ratio` compares
-      sets and ignores duplicates and order. On the existing K1 unit
-      cases, also require no duplicate ids and a compact valid prefix
-      followed by `-1`. Set equality stays.
+- [x] **4d. Stronger K1 assertions.** `_set_mismatch_ratio` still
+      compares sets and ignores duplicates and order. The existing K1
+      unit cases now also require each output row to be unique valid
+      ids, then only `-1`. A duplicate or a valid id after `-1` fails
+      even when the sets match. `test_k1_block_ids_require_packed_prefix`
+      rejects a duplicate, a valid id after `-1`, and a set mismatch.
+      Those unit cases, including the no-live-page
+      row of `-1`, passed on GPU 6. No kernel change, so the bar
+      shapes were not re-timed. Sweep and bench columns still report
+      set mismatch only.
 
 ### 5. Behavior-preserving kernel cleanup
 
