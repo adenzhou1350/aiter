@@ -290,13 +290,27 @@ them, and fix the ones that are real. Do not change score math.
       | M | L | before µs | after µs |
       |--:|--:|----------:|---------:|
       | 512 | 8192 | 30.20 | 30.46 |
-- [ ] **2b. Decode page ids.** The one-row scorer masks columns (~259)
-      but still loads `page_table[safe_req, logical_page]` with no
-      `phys_live` (~263). A dead column reads entry 0. A `-1` there, or
-      a `-1` inside the visible range, is still a cache index. Same
-      predicate as 2a. `test_*` for a no-page request whose entry 0 is
-      `-1`, and for a `-1` inside the visible range. Re-time K1 decode
-      on the bar shapes.
+- [x] **2b. Decode page ids.** The one-row scorer now requires
+      `phys_live = (phys >= 0) & (phys < n_cache_blocks)` and loads K
+      at the safe page id. A dead column still reads entry 0, but a
+      `-1` there is not a cache index, and a `-1` inside the visible
+      range drops that column. `n_cache_blocks` is a decode-launch
+      argument. Score math, the selector, and `n_columns` are unchanged.
+      `test_k1_decode_rejects_invalid_page_ids` uses M=4 and a table
+      wider than 512 columns, so the one-row scorer runs. On the
+      unfixed tree the no-page request (entry 0 is `-1`) aborted the
+      process when the selector launched. After the fix that request
+      selects nothing, and a `-1` on a visible page matches the oracle
+      with those blocks masked. `test_k1_family_a_set_equality_two_tiles`
+      stays green.
+
+      GPU 6, cold `--rotate 0`, `CACHE=0`, control taken immediately
+      before the candidate:
+
+      | M | L | before µs | after µs |
+      |--:|--:|----------:|---------:|
+      | 1 | 32768 | 15.08 | 15.00 |
+      | 8 | 32768 | 20.45 | 20.37 |
 - [ ] **2c. K1 4 GiB cache.** Same 32-bit descriptor class as 1a, on
       `k_buf` in both scorers (~203, ~425). Apply the 1a page-local
       descriptor. If 1a's helper is shared, use it; do not invent a
