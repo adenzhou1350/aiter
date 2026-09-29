@@ -425,9 +425,10 @@ numeric change, no schedule change, no bar re-time beyond the pytest
 gate unless a diff is not comment-only — if the diff is not
 comment-only, re-time the touched kernel and revert on a loss.
 
-- [ ] **5a. K2 header.** The module docstring says gfx950 always stores
-      K and V separately. Decode still overlays one tile;
-      `split_kv_lds` is prefill-only. Make the header match.
+- [x] **5a. K2 header.** The module docstring said gfx950 always stores
+      K and V separately. Decode (BLOCK_N=16) still overlays one tile;
+      ``split_kv_lds`` is gfx950 prefill only. The header now says that.
+      Docstring only, so the bar shapes were not re-timed.
 - [ ] **5b. Dead K2 values.** `k2.py` ~339 builds a tiled copy and
       discards it. ~370 discards `make_tiled_copy_B(...).get_slice(lane)`.
       Remove them if they have no side effect. Leave `qk_a_copy` and
