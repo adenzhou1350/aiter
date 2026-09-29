@@ -387,13 +387,15 @@ still-open ticket-doc half of "Earlier findings." No kernel change.
       the parent lock: fused emit writes ids with no score matrix when
       `visible <= 512`, and longer rows materialize an `[M, n_blocks]`
       fp32 buffer. The long-row allocation in `k1.py` is unchanged.
-- [ ] **4b. K1 bench timings cover the same work.** `bench_qsa_family_a_k1`
-      times `qsa_k1_block_ids` and stops at block ids. The vLLM and
-      #4882 columns time `qsa_select_paged_tokens` /
-      `qsa_4882_select_paged_tokens`, which include expand. Time expand
-      on the FlyDSL column too, or stop the competitor columns before
-      expand. Say which in the bench docstring. The layer bench is
-      already a matched chain; leave it.
+- [x] **4b. K1 bench timings cover the same work.** `bench_qsa_family_a_k1`
+      now times `_flydsl_k1_select`: `qsa_k1_block_ids`, then the vendored
+      Triton expand that live AMD select already includes. The vLLM and
+      #4882 columns still time `qsa_select_paged_tokens`, which expand
+      inside the call. Set equality stays on block ids. The layer bench
+      is unchanged. `test_family_a_k1_bench_times_expand` checks that the
+      helper's ids match `qsa_k1_block_ids` and its indices match a
+      separate expand. No kernel change, so the bar shapes were not
+      re-timed.
 - [ ] **4c. Sweep mismatches fail, and requested M is not dropped.**
       Kernel benches return `err` and `__main__` only logs the table.
       FlyDSL K1/K2 loops keep `M <= 8` and `M == 512`, so a requested
